@@ -1,0 +1,6 @@
+# Domini del traffico del Mac da intercettare con mitmproxy (un dominio per
+# riga, niente wildcard: ogni nome usato dal sito va elencato a parte).
+# Dopo una modifica: ./start-mitm.sh
+repubblica.it
+www.repubblica.it
+cube.repubblica.it

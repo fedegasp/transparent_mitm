@@ -105,8 +105,12 @@ fi
 
 echo "IP mitmproxy: $CONTAINER_IP  bridge: $BRIDGE"
 
-# HTTP/HTTPS dei client LAN → mitmproxy (instradato, destinazione invariata;
-# regola route-to generata dal daemon)
+# Domini del traffico del Mac da intercettare: il daemon li risolve e li
+# carica nella tabella pf <mitm_local>
+write_state domains "$(cat domini-mac.txt 2> /dev/null)"
+
+# HTTP/HTTPS dei client LAN, e del Mac verso <mitm_local> → mitmproxy
+# (instradato, destinazione invariata; regole route-to generate dal daemon)
 write_state route "$BRIDGE $CONTAINER_IP"
 wait_anchor "$ANCHOR" "route-to ($BRIDGE $CONTAINER_IP)"
 echo "Regola pf mitmproxy applicata"

@@ -2,12 +2,14 @@
 
 ## Obiettivo
 
-Intercettare il traffico HTTP/HTTPS di dispositivi collegati alla LAN fisica del Mac, instradandolo verso `mitmproxy` in esecuzione dentro una VM Linux gestita da Apple `container`, aggirando le restrizioni del profilo MDM enterprise che impediscono l'uso diretto di `pf`/`sysctl`/Application Firewall per processi host.
+Intercettare il traffico HTTP/HTTPS di dispositivi collegati alla LAN fisica del Mac, instradandolo verso `mitmproxy` in esecuzione dentro una VM Linux gestita da Apple `container`. Questa architettura permette il transparent proxying della rete LAN.
+
+Lo stesso container intercetta anche il traffico **del Mac stesso**, solo verso un elenco di domini scelti ([domini-mac.txt](domini-mac.txt)), anche quando il Mac non è collegato alla LAN (`en7`): punto 10.
 
 ## Perché questo approccio
 
 - Il Mac è gestito da MDM con **Digital Guardian** (`com.digitalguardian.webproxy`, Network Extension) e **BeyondTrust** (Endpoint Security + Privilege Management), oltre a **Microsoft Defender**.
-- L'**Application Firewall di macOS** è gestito centralmente ("Firewall settings cannot be modified from command line on managed Mac computers") e blocca silenziosamente le connessioni in ingresso verso processi non in whitelist (mitmproxy in ascolto sul Mac veniva droppato: SYN inviato, mai risposto).
+- L'**Application Firewall di macOS** è gestito centralmente ("Firewall settings cannot be modified from command line on managed Mac computers").
 - Il traffico **forwardato/instradato** dal kernel (non generato da un processo host) non passa dagli stessi filtri per-processo — da qui l'idea di spostare mitmproxy dentro una VM Linux (`container`), che dal punto di vista del Mac è "un altro host" di rete, non un processo locale sorvegliato.
 - Il bridging diretto di `container` verso un'interfaccia fisica (es. `en7`) **non è disponibile** nella release stabile (PR Apple `#1622` ancora aperta) — quindi il container resta sulla rete `default` di `container` (NAT vmnet, `192.168.64.0/24`), raggiunta dal Mac tramite instradamento esplicito via `pf`.
 
@@ -39,6 +41,13 @@ client LAN (192.168.3.x) ──en7──▶ Mac pf: route-to (bridge100 <IP_CONT
                      mitmweb ──▶ gateway 192.168.64.1 ──▶ NAT vmnet ──en0──▶ Internet
 
 altro traffico LAN (non-HTTP/S) ──en7──▶ Mac: nat on en0 (anchor com.mitm.nat) ──▶ Internet
+
+traffico del Mac (browser) verso <mitm_local> (IP dei domini scelti), TCP 80/443:
+  Mac ──out en0──▶ pf: route-to (bridge100 <IP_CONTAINER>)   [src IP di en0, dst invariato]
+                                       ▼
+                     container: iptables REDIRECT → :7070 ──▶ mitmweb ──▶ 192.168.64.1
+                                       ▼
+                     Mac: in bridge100, tag MITM_VM ──▶ nat on en0 ──▶ out en0 (tagged: niente route-to) ──▶ Internet
 
 DNS:
 client ──UDP/TCP 53 → 192.168.3.2──en7──▶ Mac pf: rdr (anchor com.mitm.dhcp) → <IP_DHCP>:53
@@ -90,7 +99,7 @@ nat on en0 inet from 192.168.64.0/24 to any -> (en0)
 La seconda riga **è necessaria**: il NAT della rete dei container lo fa normalmente `InternetSharing` (avviato da `container-network-vmnet`), inserendo i propri anchor pf nel ruleset principale a runtime. Un reload completo (`pfctl -f /etc/pf.conf`) li rimuove, e da quel momento i container non escono più su Internet (mitmproxy riceve le connessioni dei client ma va in timeout verso i server). Con la regola nel nostro anchor l'egress non dipende più da quegli anchor; se sono presenti, vale la prima regola che corrisponde, niente doppio NAT.
 
 `/etc/pf.anchors/com.mitm.route` e `/etc/pf.anchors/com.mitm.dhcp` sono generati dal daemon `com.mitm.pf` (punto 9) con l'IP corrente dei container, che non è fisso; i modelli delle regole sono in [daemon/mitm-pf-apply](daemon/mitm-pf-apply):
-- `com.mitm.route`: `route-to (bridge100 <IP_CONTAINER>)` del TCP 80/443 in ingresso su `en7` dalla LAN. L'interfaccia nel `route-to` è quella **bridge di vmnet** (`bridge100`), non `en7`.
+- `com.mitm.route`: `route-to (bridge100 <IP_CONTAINER>)` del TCP 80/443 in ingresso su `en7` dalla LAN. L'interfaccia nel `route-to` è quella **bridge di vmnet** (`bridge100`), non `en7`. Contiene anche le regole per il traffico del Mac verso la tabella `<mitm_local>` (punto 10).
 - `com.mitm.dhcp`: `rdr` verso `<IP_DHCP>` del relay DHCP (UDP 67 da `192.168.3.1` a `192.168.3.2`) e delle query DNS (UDP/TCP 53 dalla LAN a `192.168.3.2`). Il DNS è ristretto alle query **verso il Mac**: un client con DNS configurato a mano (es. `8.8.8.8`) esce via NAT come prima.
 
 **pf su macOS non è abilitato di default**: `pfctl -f` carica le regole ma non le attiva. Setup una tantum dopo aver modificato `/etc/pf.conf` (il file dell'anchor DHCP deve esistere, altrimenti il caricamento fallisce):
@@ -138,7 +147,7 @@ File: [entrypoint.sh](entrypoint.sh): imposta il REDIRECT `iptables` (80/443 →
 
 Punti critici:
 - **`iptables -t nat -F PREROUTING` prima di ri-aggiungere le regole**, per evitare duplicati a ogni riavvio.
-- **Match ristretto a `-s 192.168.3.0/24`**: limita il REDIRECT al solo traffico dei client LAN. Senza questo filtro si era osservato un timeout totale dell'egress del container verso Internet (vedi cronologia, punto 9).
+- **Match `! -s 192.168.64.0/24 -m addrtype ! --dst-type LOCAL`**: il REDIRECT vale per i client LAN (`192.168.3.0/24`) e per il Mac (IP di `en0`, che cambia tra casa e ufficio: punto 10), non per la rete dei container né per le connessioni dirette al container. Prima il match era `-s 192.168.3.0/24`: senza filtro sulla sorgente si era osservato un timeout totale dell'egress del container verso Internet (cronologia, punto 8), probabilmente dovuto in realtà agli anchor NAT rimossi (punto 13). **Da verificare** che il nuovo match non riproduca il problema. Una modifica di `entrypoint.sh` richiede `container build` e la ricreazione del container (`./stop-mitm.sh --rm && ./start-mitm.sh`).
 - **`tini` come PID 1** (via `ENTRYPOINT`) e **mitmweb in un ciclo `while`**: mitmweb è un processo figlio che può essere killato/riavviato senza fermare il container. Senza il ciclo, all'uscita di mitmweb termina l'entrypoint e con esso il container.
 - **`block_global=false`**: `block_global` blocca le connessioni da **client** con IP pubblico (non riguarda la destinazione). I client LAN `192.168.3.x` sono privati, quindi non è strettamente necessario; lo si tiene per non avere sorprese se un client arriva con IP non privato.
 - **Password della web UI da variabile d'ambiente** (`MITM_WEB_PASSWORD`, passata con `container run -e`), non scritta nell'immagine. `start-mitm.sh` la passa sempre, con default `password` se non impostata. Se la variabile mancasse del tutto (container avviato a mano), mitmweb genera un token casuale stampato nei log (`container logs mitmproxy.test`). La web UI è raggiungibile anche dai client LAN (il Mac inoltra `192.168.3.0/24` → `192.168.64.0/24`): con la password di default chiunque sulla LAN può accedervi.
@@ -148,7 +157,7 @@ Punti critici:
 Container separato `mitm-dhcp` con `dnsmasq`, che fa sia da DHCP sia da DNS (con cache) per la LAN: raggiunto dal relay del router e dalle query DNS dei client verso il Mac tramite gli `rdr` di pf (vedi *Flusso del traffico*). È separato da `mitmproxy.test` perché ha un ciclo di vita diverso, con script propri (`start-dhcp.sh` / `stop-dhcp.sh`) che non dipendono da mitmproxy: `stop-mitm.sh` ferma l'intercettazione ma lascia attivo il DHCP, così i client continuano a ricevere/rinnovare il lease e navigano via NAT del Mac.
 
 Alternative scartate:
-- **DHCP/DNS server su macOS** (`dnsmasq`/`kea` da brew): processo in ascolto sul Mac, bloccato dall'Application Firewall come mitmproxy (cronologia, punto 2). Provato anche per il DNS: la porta 53 non riceve nulla.
+- **DHCP/DNS server su macOS** (`dnsmasq`/`kea` da brew): processo in ascolto sul Mac, bloccato dall'Application Firewall come mitmproxy (cronologia, punto 1). Provato anche per il DNS: la porta 53 non riceve nulla.
 - **DNS pubblici fissi** (`1.1.1.1`, `1.0.0.1`): non raggiungibili su tutte le reti (es. reti aziendali che consentono solo i propri DNS).
 - **Upstream DNS letti da `en0`** (`ipconfig getoption en0 domain_name_server`) e scritti in un `resolv-file` per `dnsmasq`: richiede un job che segua i cambi di rete. Il resolver di vmnet (`192.168.64.1`) li segue già da solo, e rispetta anche la configurazione DNS completa del Mac (resolver per dominio, VPN).
 - **`bootpd` di macOS** (`/etc/bootpd.plist`): lo stesso file è usato da Condivisione Internet/vmnet, rischio di interferire con la rete dei container.
@@ -172,10 +181,11 @@ Configurazione del router (Zyxel): DHCP in modalità **Relay**, server `192.168.
 
 Log DHCP: `container logs mitm-dhcp` (per vedere anche le query DNS, aggiungere `log-queries` a `dnsmasq.conf`).
 
-Verifica del DNS (dal Mac non funziona per il filtro di Digital Guardian: va fatta da un altro container o da un client LAN):
+Verifica del DNS, direttamente dal Mac (UDP; con `+tcp` per il TCP):
 ```bash
-container exec mitmproxy.test dig @$(container inspect mitm-dhcp | jq -r '.[0].status.networks[0].ipv4Address' | cut -d/ -f1) example.com
+dig @$(container inspect mitm-dhcp | jq -r '.[0].status.networks[0].ipv4Address' | cut -d/ -f1) example.com
 ```
+Così si prova `dnsmasq` e il suo upstream, non l'`rdr` di `192.168.3.2:53`: quello va verificato da un client LAN.
 
 ### 7. Avvio
 
@@ -213,9 +223,10 @@ Il DNS integrato risolve **solo i container il cui nome è `<nome>.<dominio>`**:
 
 Il nome vale **solo sul Mac**: il server DNS di `container` risponde su `127.0.0.1`, i client LAN non possono usarlo.
 
-Per verificare la risoluzione (da terminale `curl` verso i container va in timeout per il filtro di Digital Guardian sui processi del Mac, cronologia punto 1: la web UI va provata dal browser):
+Per verificare la risoluzione e la web UI da terminale (senza password mitmweb risponde `403` con la pagina di login, con `?token=<password>` risponde `200`):
 ```bash
 dscacheutil -q host -a name mitmproxy.test
+curl -s -o /dev/null -w '%{http_code} %{remote_ip}\n' http://mitmproxy.test:8081/
 ```
 
 Per fermare: `./stop-mitm.sh` (punto 8).
@@ -266,8 +277,10 @@ script utente ──scrive IP──▶ /usr/local/var/mitm-pf/{route,dhcp}   (ut
 
 - **File di stato** (scritti con rename atomico, così il daemon non legge mai un file a metà):
   - `route` → `<bridge> <IP mitmproxy>` (vuoto = nessuna intercettazione);
-  - `dhcp` → `<IP dnsmasq>` (vuoto = nessun DHCP/DNS).
-- **Validazione**: il contenuto è scrivibile dall'utente, quindi non viene mai eseguito né copiato così com'è; il daemon accetta solo `bridge<N>` e indirizzi IPv4 (regex) e genera la regola da un modello fisso. Qualsiasi altro contenuto svuota la regola.
+  - `dhcp` → `<IP dnsmasq>` (vuoto = nessun DHCP/DNS);
+  - `domains` → copia di [domini-mac.txt](domini-mac.txt), scritta da `start-mitm.sh` (punto 10).
+- **Validazione**: il contenuto è scrivibile dall'utente, quindi non viene mai eseguito né copiato così com'è; il daemon accetta solo `bridge<N>`, indirizzi IPv4 e nomi di dominio (regex, al massimo 64) e genera la regola da un modello fisso. Qualsiasi altro contenuto svuota la regola (o, per i domini, viene ignorato).
+- **Ogni 60s** (`StartInterval`): con l'intercettazione attiva il daemon ririsolve i domini e aggiorna la tabella `<mitm_local>`; se non cambia nulla non tocca pf.
 - **Script di root in `/usr/local/libexec/mitm-pf-apply`** (root:wheel, 755), non nella directory del progetto: altrimenti chi può scrivere nel progetto potrebbe far eseguire codice a root.
 - **Nessun reload inutile**: l'anchor viene ricaricato (e gli stati chiusi) solo se la regola cambia.
 - **Al boot** (`RunAtLoad`): i file di stato **precedenti all'ultimo boot** (`kern.boottime`) sono ignorati, quindi le regole della sessione precedente vengono svuotate. Risolve il `route-to` verso un IP inesistente rimasto dopo un riavvio con mitmproxy attivo.
@@ -297,27 +310,67 @@ Installazione (utente normale, senza sudo) e rimozione:
 
 Log: `~/Library/Logs/mitm-dhcp.log`. Stato: `launchctl print gui/$(id -u)/com.mitm.dhcp | grep -E 'state|last exit'`.
 
+### 10. Traffico del Mac verso domini scelti (`domini-mac.txt`)
+
+Il browser del Mac passa da mitmproxy solo per i domini elencati in [domini-mac.txt](domini-mac.txt), con o senza `en7`: servono solo il container ed `en0`. Si attiva e si disattiva insieme all'intercettazione LAN (`start-mitm.sh` / `stop-mitm.sh`); dopo una modifica dell'elenco basta rilanciare `./start-mitm.sh`.
+
+Perché non basta una rotta (`route add -host repubblica.it -interface bridge100`):
+1. `-interface` tratta la destinazione come diretta su `bridge100`: ARP per l'IP del sito, nessuno risponde. Servirebbe il container come gateway.
+2. Anche con il gateway si crea un loop: la connessione di mitmproxy verso lo stesso IP passa dal Mac, trova la stessa rotta e torna al container. La tabella di routing decide solo sulla destinazione.
+3. Il REDIRECT nel container valeva solo per `-s 192.168.3.0/24`.
+4. Una rotta vale per un IP, non per un dominio, e le CDN usano più IP che cambiano.
+
+Regole pf (in `com.mitm.route`, generate dal daemon, modello in [daemon/mitm-pf-apply](daemon/mitm-pf-apply)):
+```
+table <mitm_local> persist
+pass in on bridge100 inet proto tcp from <IP_CONTAINER> to any port { 80, 443 } tag MITM_VM keep state
+pass out quick on en0 route-to (bridge100 <IP_CONTAINER>) inet proto tcp from (en0) to <mitm_local> port { 80, 443 } ! tagged MITM_VM keep state
+block return out quick on en0 inet6 proto tcp from any to <mitm_local> port { 80, 443 }
+block return out quick on en0 proto udp from any to <mitm_local> port 443
+```
+- **`route-to` in uscita** su `en0`: come per la LAN il pacchetto non viene tradotto, il REDIRECT avviene nel container (`SO_ORIGINAL_DST`). La sorgente resta l'IP di `en0`: il container risponde via `192.168.64.1` e lo stato pf (floating) copre il ritorno su `bridge100`.
+- **Tag anti-loop**: le regole di filtro in uscita vedono gli indirizzi **dopo il NAT**, quindi le connessioni di mitmproxy verso Internet hanno anch'esse sorgente `(en0)` su `en0`. Vengono marcate `MITM_VM` entrando da `bridge100` ed escluse dal `route-to` con `! tagged`. Il tag è *sticky* (resta anche se una regola successiva decide): la regola che lo applica non è `quick` e non scavalca le regole `com.apple/*` su `bridge100`. È ristretta all'IP di mitmproxy e alle porte 80/443.
+- **IPv6 e QUIC respinti** verso `<mitm_local>` (RST / ICMP unreachable): il container non gestisce IPv6 e il `route-to` è solo TCP. Il browser ripiega subito su TCP IPv4, che viene intercettato. Anche i client LAN, verso questi IP, perdono QUIC (escono via NAT su `en0`).
+- **Tabella `<mitm_local>`**: il daemon risolve i domini con `dscacheutil` (resolver e cache di sistema, gli stessi del browser) e tiene gli IP visti negli **ultimi 15 minuti**: CloudFront (repubblica.it) cambia insieme di IP a ogni scadenza del TTL (60s), e il browser può usarne uno ottenuto prima dell'ultima risoluzione. File generati: `/etc/pf.anchors/com.mitm.local` (IP correnti) e `com.mitm.local.seen` (con l'ora dell'ultima risoluzione). La tabella **non** è caricata da `pf.conf`: i nomi non vengono risolti al boot (rete assente = caricamento fallito).
+- **Stop o cambio IP del container**: il daemon chiude anche gli stati verso gli IP della tabella (`pfctl -k 0.0.0.0/0 -k <IP>`), così le connessioni del browser verso il vecchio container cadono subito invece di restare appese.
+
+Ogni nome usato dal sito va elencato (`repubblica.it` e `www.repubblica.it` sono distinti, niente wildcard); risorse su altri domini (CDN di immagini, script) non sono intercettate se non sono in elenco.
+
+**CA di mitmproxy sul Mac**: `./mitmproxy/mitmproxy-ca-cert.pem`, da aggiungere come attendibile al portachiavi (Safari e Chrome usano quello di sistema; Firefox ha un archivio proprio, oppure `security.enterprise_roots.enabled`). Senza, il browser mostra un errore di certificato sui domini in elenco. Su un Mac gestito da MDM l'aggiunta di una root CA può essere limitata da policy.
+
+Verifica:
+```bash
+sudo pfctl -a com.mitm.route -t mitm_local -T show
+sudo pfctl -a com.mitm.route -vsr
+curl -sv -o /dev/null https://www.repubblica.it/ 2>&1 | grep -i issuer
+```
+Con l'intercettazione attiva l'issuer è `mitmproxy`, e il flusso compare nella web UI con client l'IP di `en0`. Oggi (senza intercettazione) è `Amazon RSA 2048 M04`: Digital Guardian non fa ispezione TLS su queste connessioni.
+
 ## Problemi diagnosticati durante la costruzione (cronologia)
 
-1. **pf/sysctl "nessun errore, nessun effetto"** → causa: Network Extension di Digital Guardian (`DGWebProxy`) intercetta a livello NECP le connessioni **generate da processi sul Mac stesso**, bypassando `pf`. Confermato non essere la causa dei problemi successivi con traffico di solo transito (che passa senza toccare NECP).
-2. **Application Firewall di macOS blocca mitmproxy in ascolto sul Mac** → SYN mai risposto, gestione centralizzata da MDM, non modificabile via CLI. Root cause della decisione di spostare mitmproxy in un container.
-3. **`rdr` verso `127.0.0.1` non funzionava** → sospetto anti-spoofing su loopback da sorgente esterna; risolto (poi superato) instradando verso l'IP reale/il container invece che verso loopback.
-4. **`FileNotFoundError` in mitmproxy transparent mode dentro il container** → causato dal fare NAT su macOS (`rdr`) invece che dentro il container: mitmproxy su Linux recupera la destinazione originale via `getsockopt(SO_ORIGINAL_DST)`, che richiede che il redirect avvenga nello stesso kernel. Risolto passando a `route-to` (pf instrada senza tradurre) + `iptables REDIRECT` locale al container.
-5. **Container non restava in esecuzione** → `iptables` falliva per mancanza della capability `NET_ADMIN`. Risolto con `--cap-add NET_ADMIN`.
-6. **IP del container non fissabile** → `--network` supporta solo `mac`/`mtu`, non `ip`. Risolto con script che legge l'IP a runtime (`container inspect`) e rigenera la regola pf.
-7. **`container inspect` falliva se l'intero script girava con `sudo`** → il servizio `container` è legato alla sessione utente, non root. Risolto elevando solo i comandi che scrivono su `/etc` e ricaricano `pf`, non l'intero script.
-8. **Traffico non visibile / connessioni appese** → `route-to` puntava all'interfaccia sbagliata (`en7` invece del bridge vmnet `bridge100`) — il container non è raggiungibile da `en7`. Ora lo script ricava il bridge dal gateway del container.
-9. **Egress del container in timeout totale dopo aver attivato il REDIRECT** → risolto aggiungendo `-s 192.168.3.0/24` al match. La causa esatta non è chiarita: in netfilter `PREROUTING` non vede il traffico generato localmente e le risposte in ingresso hanno porta *sorgente* 80/443, non di destinazione; il filtro resta comunque corretto perché limita il REDIRECT ai soli client LAN.
-10. **Rete dedicata `mitm-net` non necessaria** → una rete creata con `container network create --subnet 192.168.70.0/24` ottiene un proprio bridge (non `bridge100`) e rende incoerenti subnet/gateway/interfaccia del `route-to`. Si usa la rete `default`.
-11. **mitmproxy vecchio su Debian bookworm** → Python 3.11 ⇒ pip installa mitmproxy 11.0.2, senza `web_password`. Risolto con immagine base `python:3.13-slim-bookworm` e versione fissata.
-12. **Configurazione di rete manuale sui device** → il DHCP del router non permette un gateway diverso da sé stesso. Risolto con DHCP relay del router verso il Mac + `rdr` pf + `dnsmasq` in container (punto 6), che assegna il Mac come gateway.
-13. **Container DHCP che si ferma subito dopo l'avvio** → `dnsmasq` richiede `NET_ADMIN` per il DHCP. Risolto con `--cap-add NET_ADMIN` anche su `mitm-dhcp`.
-14. **DHCP ok ma il telefono non naviga** → mitmweb riceveva le connessioni (`192.168.3.168`) ma andava in timeout verso tutti i server (`Connect call failed … Errno 110`); dal container falliva anche `curl https://example.com`. Causa: il reload completo di `/etc/pf.conf` (fatto per aggiungere `com.mitm.dhcp`) aveva rimosso gli anchor NAT inseriti a runtime da `InternetSharing` per `192.168.64.0/24`. Risolto aggiungendo `nat on en0 inet from 192.168.64.0/24 to any -> (en0)` a `com.mitm.nat` e ricaricando solo quell'anchor (`pfctl -a com.mitm.nat -f …`). Alternativa senza pf: `container system stop` / `container system start` (poi `./start-mitm.sh`), ma il problema si ripresenterebbe al successivo reload completo.
-15. **Web UI raggiungibile solo digitando l'IP del container** (che cambia a ogni riavvio) → risolto con il DNS integrato di `container` (`container system dns create test`). Il primo tentativo non risolveva nulla (NXDOMAIN) neanche per container creati con `--dns-domain test`: il DNS registra solo i container il cui nome è già `<nome>.<dominio>`. Rinominato il container da `mitm-proxy` a `mitmproxy.test`.
-16. **Dopo un reboot il telefono non navigava e nulla ripartiva** → i servizi di `container` non si registrano da soli dopo il reboot, e `com.mitm.route` conteneva ancora il `route-to` verso l'IP del container della sessione precedente (ricaricato da `pf.conf` all'avvio). Risolto con il LaunchDaemon `com.mitm.pf` (svuota al boot le regole con file di stato precedenti al boot) e il LaunchAgent `com.mitm.dhcp` (avvia `container` e il DHCP al login). Il daemon elimina anche i prompt `sudo` degli script.
-17. **DNS pubblici non raggiungibili su alcune reti** → i client ricevevano `1.1.1.1`/`1.0.0.1`, bloccati su reti che consentono solo i propri DNS; `dnsmasq` installato con brew sul Mac non riceveva nulla sulla porta 53 (Application Firewall). Risolto attivando il DNS nella stessa istanza `dnsmasq` del DHCP, con `rdr` pf `192.168.3.2:53` → container e upstream `192.168.64.1` (resolver del Mac, quindi i DNS di `en0`). Ai client viene offerto solo `192.168.3.2`.
+1. **Application Firewall di macOS blocca mitmproxy in ascolto sul Mac** → SYN mai risposto, gestione centralizzata da MDM, non modificabile via CLI. Root cause della decisione di spostare mitmproxy in un container.
+2. **`rdr` verso `127.0.0.1` non funzionava** → sospetto anti-spoofing su loopback da sorgente esterna; risolto (poi superato) instradando verso l'IP reale/il container invece che verso loopback.
+3. **`FileNotFoundError` in mitmproxy transparent mode dentro il container** → causato dal fare NAT su macOS (`rdr`) invece che dentro il container: mitmproxy su Linux recupera la destinazione originale via `getsockopt(SO_ORIGINAL_DST)`, che richiede che il redirect avvenga nello stesso kernel. Risolto passando a `route-to` (pf instrada senza tradurre) + `iptables REDIRECT` locale al container.
+4. **Container non restava in esecuzione** → `iptables` falliva per mancanza della capability `NET_ADMIN`. Risolto con `--cap-add NET_ADMIN`.
+5. **IP del container non fissabile** → `--network` supporta solo `mac`/`mtu`, non `ip`. Risolto con script che legge l'IP a runtime (`container inspect`) e rigenera la regola pf.
+6. **`container inspect` falliva se l'intero script girava con `sudo`** → il servizio `container` è legato alla sessione utente, non root. Risolto elevando solo i comandi che scrivono su `/etc` e ricaricano `pf`, non l'intero script.
+7. **Traffico non visibile / connessioni appese** → `route-to` puntava all'interfaccia sbagliata (`en7` invece del bridge vmnet `bridge100`) — il container non è raggiungibile da `en7`. Ora lo script ricava il bridge dal gateway del container.
+8. **Egress del container in timeout totale dopo aver attivato il REDIRECT** → risolto aggiungendo `-s 192.168.3.0/24` al match. La causa esatta non è chiarita: in netfilter `PREROUTING` non vede il traffico generato localmente e le risposte in ingresso hanno porta *sorgente* 80/443, non di destinazione; il filtro resta comunque corretto perché limita il REDIRECT ai soli client LAN.
+9. **Rete dedicata `mitm-net` non necessaria** → una rete creata con `container network create --subnet 192.168.70.0/24` ottiene un proprio bridge (non `bridge100`) e rende incoerenti subnet/gateway/interfaccia del `route-to`. Si usa la rete `default`.
+10. **mitmproxy vecchio su Debian bookworm** → Python 3.11 ⇒ pip installa mitmproxy 11.0.2, senza `web_password`. Risolto con immagine base `python:3.13-slim-bookworm` e versione fissata.
+11. **Configurazione di rete manuale sui device** → il DHCP del router non permette un gateway diverso da sé stesso. Risolto con DHCP relay del router verso il Mac + `rdr` pf + `dnsmasq` in container (punto 6), che assegna il Mac come gateway.
+12. **Container DHCP che si ferma subito dopo l'avvio** → `dnsmasq` richiede `NET_ADMIN` per il DHCP. Risolto con `--cap-add NET_ADMIN` anche su `mitm-dhcp`.
+13. **DHCP ok ma il telefono non naviga** → mitmweb riceveva le connessioni (`192.168.3.168`) ma andava in timeout verso tutti i server (`Connect call failed … Errno 110`); dal container falliva anche `curl https://example.com`. Causa: il reload completo di `/etc/pf.conf` (fatto per aggiungere `com.mitm.dhcp`) aveva rimosso gli anchor NAT inseriti a runtime da `InternetSharing` per `192.168.64.0/24`. Risolto aggiungendo `nat on en0 inet from 192.168.64.0/24 to any -> (en0)` a `com.mitm.nat` e ricaricando solo quell'anchor (`pfctl -a com.mitm.nat -f …`). Alternativa senza pf: `container system stop` / `container system start` (poi `./start-mitm.sh`), ma il problema si ripresenterebbe al successivo reload completo.
+14. **Web UI raggiungibile solo digitando l'IP del container** (che cambia a ogni riavvio) → risolto con il DNS integrato di `container` (`container system dns create test`). Il primo tentativo non risolveva nulla (NXDOMAIN) neanche per container creati con `--dns-domain test`: il DNS registra solo i container il cui nome è già `<nome>.<dominio>`. Rinominato il container da `mitm-proxy` a `mitmproxy.test`.
+15. **Dopo un reboot il telefono non navigava e nulla ripartiva** → i servizi di `container` non si registrano da soli dopo il reboot, e `com.mitm.route` conteneva ancora il `route-to` verso l'IP del container della sessione precedente (ricaricato da `pf.conf` all'avvio). Risolto con il LaunchDaemon `com.mitm.pf` (svuota al boot le regole con file di stato precedenti al boot) e il LaunchAgent `com.mitm.dhcp` (avvia `container` e il DHCP al login). Il daemon elimina anche i prompt `sudo` degli script.
+16. **DNS pubblici non raggiungibili su alcune reti** → i client ricevevano `1.1.1.1`/`1.0.0.1`, bloccati su reti che consentono solo i propri DNS; `dnsmasq` installato con brew sul Mac non riceveva nulla sulla porta 53 (Application Firewall). Risolto attivando il DNS nella stessa istanza `dnsmasq` del DHCP, con `rdr` pf `192.168.3.2:53` → container e upstream `192.168.64.1` (resolver del Mac, quindi i DNS di `en0`). Ai client viene offerto solo `192.168.3.2`.
 
 ## Limiti noti / cose da verificare ancora
+
+- **Traffico del Mac (punto 10) non ancora provato end-to-end**. Da verificare: che il `tag` eviti davvero il loop (contatori di `pfctl -a com.mitm.route -vsr`: la regola `route-to` su `en0` deve contare solo le connessioni del browser); che il nuovo match `iptables` non riproduca il blocco dell'egress (cronologia, punto 8); che le risposte del container verso l'IP di `en0` tornino al browser; che con `route-to` in uscita i checksum dei pacchetti generati localmente (offload di `en0`) siano corretti su `bridge100` (sintomo: SYN mai risposto, `tcpdump` nel container segnala `bad cksum`).
+- **Intercettazione del Mac per IP, non per nome**: gli IP CloudFront sono condivisi tra molti siti (il certificato di `www.repubblica.it` è quello di `www.lastampa.it`), quindi viene intercettato anche il traffico di altri siti o app che in quel momento usano gli stessi IP. Un'app con certificate pinning su uno di quegli IP fallirebbe. Rimedio possibile: un addon mitmproxy che, per i client non LAN, lascia passare senza intercettare (`ignore_connection`) le connessioni il cui SNI non è in elenco.
+- **Browser con DNS proprio** (Chrome/Firefox con DNS-over-HTTPS) possono ottenere IP diversi da quelli risolti dal daemon: quelle connessioni non vengono intercettate.
+- **Traffico del Mac solo su `en0`**: con una VPN (`utun*`) o un'altra interfaccia come rotta di default le regole non scattano.
 
 - **QUIC/HTTP3 su UDP 443** non viene intercettato (`route-to`/`REDIRECT` sono solo TCP) e, non essendoci una regola che lo blocchi, esce via NAT su `en0`. Client come Safari/Chrome su iOS possono usarlo di default per molti siti, con traffico che bypassa mitmproxy senza errori visibili. Per forzare il fallback su TCP si può aggiungere alla regola `com.mitm.route` in [daemon/mitm-pf-apply](daemon/mitm-pf-apply) (poi `sudo ./daemon/install.sh`): `block in quick on en7 inet proto udp from 192.168.3.0/24 to any port 443`.
 - **Tra boot e login niente DHCP**: i servizi di `container` girano solo nella sessione utente, quindi il DHCP parte al login (LaunchAgent, punto 9), non al boot. Prima del login i client non ottengono/rinnovano il lease. Il daemon pf invece parte al boot e svuota le regole della sessione precedente.

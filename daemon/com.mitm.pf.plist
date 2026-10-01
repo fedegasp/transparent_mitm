@@ -16,6 +16,9 @@
     <array>
         <string>/usr/local/var/mitm-pf</string>
     </array>
+    <!-- Ririsolve i domini del Mac (tabella mitm_local): gli IP delle CDN cambiano -->
+    <key>StartInterval</key>
+    <integer>60</integer>
     <key>StandardOutPath</key>
     <string>/var/log/mitm-pf.log</string>
     <key>StandardErrorPath</key>
