@@ -18,7 +18,19 @@ if [ "${1:-}" = "--remove" ]; then
   exit 0
 fi
 
+PROJECT_DIR="$(cd .. && pwd -P)"
+
+# I percorsi finiscono in XML e in un'espressione sed: niente caratteri speciali
+for p in "$PROJECT_DIR" "$HOME"; do
+  case "$p" in
+    *[\&\<\>\|\\]*) echo "Percorso non supportato: $p" >&2; exit 1 ;;
+  esac
+done
+
 mkdir -p ~/Library/LaunchAgents
-cp com.mitm.dhcp.plist "$PLIST"
+sed -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" -e "s|__HOME__|$HOME|g" \
+  com.mitm.dhcp.plist > "$PLIST.tmp"
+plutil -lint -s "$PLIST.tmp"
+mv "$PLIST.tmp" "$PLIST"
 launchctl bootstrap "$DOMAIN" "$PLIST"
 echo "LaunchAgent com.mitm.dhcp installato. Log: ~/Library/Logs/mitm-dhcp.log"

@@ -4,7 +4,8 @@
   Avvio del DHCP al login (LaunchAgent utente, nessun privilegio).
   Dopo un reboot i servizi di container non sono registrati: prima
   container system start (idempotente), poi start-dhcp.sh.
-  Installazione: ./launchagent/install.sh
+  Installazione: ./launchagent/install.sh, che sostituisce __PROJECT_DIR__
+  e __HOME__ (launchd non espande ~ né $HOME).
 -->
 <plist version="1.0">
 <dict>
@@ -14,7 +15,9 @@
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>container system start &amp;&amp; exec /Users/f.gasperini/test/start-dhcp.sh</string>
+        <!-- Percorso dello script come $0: non viene interpretato dalla shell -->
+        <string>container system start &amp;&amp; exec "$0"</string>
+        <string>__PROJECT_DIR__/start-dhcp.sh</string>
     </array>
     <!-- container è in /usr/local/bin, assente dal PATH di default di launchd -->
     <key>EnvironmentVariables</key>
@@ -25,8 +28,8 @@
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/f.gasperini/Library/Logs/mitm-dhcp.log</string>
+    <string>__HOME__/Library/Logs/mitm-dhcp.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/f.gasperini/Library/Logs/mitm-dhcp.log</string>
+    <string>__HOME__/Library/Logs/mitm-dhcp.log</string>
 </dict>
 </plist>

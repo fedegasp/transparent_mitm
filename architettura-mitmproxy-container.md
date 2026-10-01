@@ -300,7 +300,7 @@ Verifica: `sudo launchctl print system/com.mitm.pf | grep -E 'state|last exit'`.
 
 I servizi di `container` sono job launchd della **sessione utente**: dopo un reboot non sono registrati (`apiserver is not running and not registered with launchd`) e prima del login non possono girare. Il LaunchAgent, a ogni login, lancia `container system start` (idempotente: con i servizi già attivi termina con successo) e poi `start-dhcp.sh`. mitmproxy **non** parte al login: si avvia a mano con `./start-mitm.sh`.
 
-Definizione in [launchagent/com.mitm.dhcp.plist](launchagent/com.mitm.dhcp.plist) (`container` è in `/usr/local/bin`, quindi il plist imposta `PATH`, assente da quello di default di launchd).
+Definizione in [launchagent/com.mitm.dhcp.plist](launchagent/com.mitm.dhcp.plist) (`container` è in `/usr/local/bin`, quindi il plist imposta `PATH`, assente da quello di default di launchd). Il plist del progetto non contiene percorsi assoluti: launchd non espande `~` né `$HOME`, quindi `install.sh` sostituisce i segnaposto `__PROJECT_DIR__` e `__HOME__` con la directory del progetto e la home dell'utente. Se il progetto viene spostato, va rilanciato `./launchagent/install.sh`.
 
 Installazione (utente normale, senza sudo) e rimozione:
 ```bash
