@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mitm.pf</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/mitm-pf-apply</string>
+    </array>
+    <!-- Al boot: svuota le regole della sessione precedente -->
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- A ogni modifica dei file di stato scritti dagli script utente -->
+    <key>WatchPaths</key>
+    <array>
+        <string>/usr/local/var/mitm-pf</string>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/var/log/mitm-pf.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/mitm-pf.log</string>
+</dict>
+</plist>

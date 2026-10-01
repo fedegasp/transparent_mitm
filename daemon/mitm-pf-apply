@@ -1,0 +1,73 @@
+#!/bin/bash
+# Eseguito da root via LaunchDaemon com.mitm.pf (installato in
+# /usr/local/libexec). Legge gli IP scritti dagli script utente in
+# /usr/local/var/mitm-pf/ e rigenera gli anchor pf. I file di stato sono
+# scrivibili dall'utente: il contenuto viene validato, mai eseguito.
+#
+#   route  →  "<bridge> <IP mitmproxy>"   (vuoto/assente = nessuna intercettazione)
+#   dhcp   →  "<IP dnsmasq>"              (vuoto/assente = nessun DHCP)
+#
+# File più vecchi dell'ultimo boot sono ignorati: dopo un riavvio i container
+# sono fermi e le regole della sessione precedente vanno svuotate.
+set -u
+
+STATE=/usr/local/var/mitm-pf
+ANCHORS=/etc/pf.anchors
+ROUTER=192.168.3.1
+MAC_LAN_IP=192.168.3.2
+IP_RE='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+IF_RE='^bridge[0-9]{1,3}$'
+
+# "{ sec = 1790839610, usec = 680084 } ..." → 1790839610
+BOOT=$(sysctl -n kern.boottime | sed -E 's/^\{ sec = ([0-9]+),.*/\1/')
+
+# Contenuto del file di stato, vuoto se assente o precedente al boot
+read_state() {
+  local f="$STATE/$1"
+  [ -f "$f" ] || return 0
+  [ "$(stat -f %m "$f")" -ge "$BOOT" ] || return 0
+  head -c 64 "$f" | head -n 1
+}
+
+# Scrive l'anchor solo se cambia; ritorna 0 se è cambiato
+write_anchor() {
+  local file="$ANCHORS/$1" new="$2"
+  [ -f "$file" ] && [ "$(cat "$file")" = "$new" ] && return 1
+  printf '%s' "$new" > "$file"
+  [ -n "$new" ] && printf '\n' >> "$file"
+  return 0
+}
+
+# --- mitmproxy: route-to ---
+read -r BRIDGE MITM_IP _ <<<"$(read_state route)"
+RULE=""
+if [[ ${BRIDGE:-} =~ $IF_RE ]] && [[ ${MITM_IP:-} =~ $IP_RE ]]; then
+  RULE="pass in quick on en7 route-to ($BRIDGE $MITM_IP) inet proto tcp from 192.168.3.0/24 to any port { 80, 443 } keep state"
+fi
+if write_anchor com.mitm.route "$RULE"; then
+  if [ -n "$RULE" ]; then
+    pfctl -a com.mitm.route -f "$ANCHORS/com.mitm.route"
+  else
+    pfctl -a com.mitm.route -F rules
+  fi
+  # Connessioni dei client ancora legate alla regola precedente
+  pfctl -k 192.168.3.0/24
+fi
+
+# --- DHCP: rdr del relay ---
+read -r DHCP_IP _ <<<"$(read_state dhcp)"
+RULE=""
+if [[ ${DHCP_IP:-} =~ $IP_RE ]]; then
+  RULE="rdr on en7 inet proto udp from $ROUTER to $MAC_LAN_IP port 67 -> $DHCP_IP port 67"
+fi
+if write_anchor com.mitm.dhcp "$RULE"; then
+  if [ -n "$RULE" ]; then
+    pfctl -a com.mitm.dhcp -f "$ANCHORS/com.mitm.dhcp"
+  else
+    pfctl -a com.mitm.dhcp -F nat
+  fi
+  pfctl -k "$ROUTER" -k "$MAC_LAN_IP"
+fi
+
+pfctl -s info | grep -q 'Status: Enabled' || pfctl -E
+exit 0

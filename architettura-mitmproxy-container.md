@@ -25,7 +25,7 @@ I container usano la rete `default`: **non serve creare una rete dedicata**. Sub
 ```bash
 container network inspect default | jq '.[0].status'
 ```
-Il nome del bridge (`bridge100`) non è garantito stabile: lo script al punto 3 lo ricava a runtime dall'interfaccia che ha l'IP del gateway.
+Il nome del bridge (`bridge100`) non è garantito stabile: `start-mitm.sh` (punto 3) lo ricava a runtime dall'interfaccia che ha l'IP del gateway.
 
 ## Flusso del traffico
 
@@ -85,7 +85,7 @@ load anchor "com.mitm.nat" from "/etc/pf.anchors/com.mitm.nat"
 load anchor "com.mitm.route" from "/etc/pf.anchors/com.mitm.route"
 load anchor "com.mitm.dhcp" from "/etc/pf.anchors/com.mitm.dhcp"
 ```
-Il DHCP ha un **anchor separato** (`com.mitm.dhcp`, dichiarato come `rdr-anchor`: le regole `rdr` in un anchor dichiarato solo con `anchor` verrebbero ignorate). Così `stop-mitm.sh` può rimuovere l'intercettazione senza interrompere il DHCP.
+Il DHCP ha un **anchor separato** (`com.mitm.dhcp`, dichiarato come `rdr-anchor`: le regole `rdr` in un anchor dichiarato solo con `anchor` verrebbero ignorate). Così DHCP e mitmproxy hanno ciascuno il proprio anchor e i propri script (punti 3 e 8): `stop-mitm.sh` rimuove l'intercettazione senza interrompere il DHCP.
 
 `/etc/pf.anchors/com.mitm.nat` (NAT verso Internet per il resto del traffico LAN, non HTTP/S, e per l'egress dei container):
 ```
@@ -94,13 +94,13 @@ nat on en0 inet from 192.168.64.0/24 to any -> (en0)
 ```
 La seconda riga **è necessaria**: il NAT della rete dei container lo fa normalmente `InternetSharing` (avviato da `container-network-vmnet`), inserendo i propri anchor pf nel ruleset principale a runtime. Un reload completo (`pfctl -f /etc/pf.conf`) li rimuove, e da quel momento i container non escono più su Internet (mitmproxy riceve le connessioni dei client ma va in timeout verso i server). Con la regola nel nostro anchor l'egress non dipende più da quegli anchor; se sono presenti, vale la prima regola che corrisponde, niente doppio NAT.
 
-`/etc/pf.anchors/com.mitm.route` (rigenerato dinamicamente dallo script al punto 3 — l'IP del container non è fisso):
+`/etc/pf.anchors/com.mitm.route` (rigenerato da `start-mitm.sh`, svuotato da `stop-mitm.sh` — l'IP del container non è fisso):
 ```
 pass in quick on en7 route-to (bridge100 <IP_CONTAINER>) inet proto tcp from 192.168.3.0/24 to any port { 80, 443 } keep state
 ```
 > Nota: l'interfaccia nel `route-to` è quella **bridge di vmnet** (`bridge100`), non `en7`.
 
-`/etc/pf.anchors/com.mitm.dhcp` (rigenerato dallo script — anche l'IP del container DHCP non è fisso):
+`/etc/pf.anchors/com.mitm.dhcp` (rigenerato da `start-dhcp.sh`, svuotato da `stop-dhcp.sh` — anche l'IP del container DHCP non è fisso):
 ```
 rdr on en7 inet proto udp from 192.168.3.1 to 192.168.3.2 port 67 -> <IP_DHCP> port 67
 ```
@@ -115,45 +115,48 @@ sudo pfctl -E
 ```
 Il reload completo rimuove gli anchor di `InternetSharing` (vedi sopra): va fatto **solo dopo** aver aggiornato `com.mitm.nat` con la riga per `192.168.64.0/24`.
 
-Dopo il setup iniziale, lo script ricarica **solo gli anchor** `com.mitm.route` e `com.mitm.dhcp` (`pfctl -a <anchor> -f ...`) e non l'intero `/etc/pf.conf`: ricaricare il ruleset principale può rimuovere gli anchor inseriti dinamicamente dai servizi di sistema (vedi commento in testa a `/etc/pf.conf`).
+Dopo il setup iniziale gli anchor `com.mitm.route` e `com.mitm.dhcp` li gestisce il LaunchDaemon `com.mitm.pf` (punto 9), che ricarica **solo il singolo anchor** (`pfctl -a <anchor> -f ...`) e non l'intero `/etc/pf.conf`: ricaricare il ruleset principale può rimuovere gli anchor inseriti dinamicamente dai servizi di sistema (vedi commento in testa a `/etc/pf.conf`).
 
-### 3. Script di avvio (`start-mitm.sh`)
+### 3. Script di avvio (`start-dhcp.sh`, `start-mitm.sh`)
 
-L'IP dei container cambia a ogni riavvio (non esiste un flag per fissarlo — `container run --network` supporta solo `mac`/`mtu`, non `ip`). Lo script gestisce entrambi i container (`mitmproxy.test` e `mitm-dhcp`) ed è **idempotente**, si può rilanciare in qualsiasi momento:
-- container **inesistente** → lo crea con `container run` (è l'unico momento in cui viene letta `MITM_WEB_PASSWORD`, default `password`);
+L'IP dei container cambia a ogni riavvio (non esiste un flag per fissarlo — `container run --network` supporta solo `mac`/`mtu`, non `ip`): gli script leggono l'IP corrente e rigenerano l'anchor pf corrispondente.
+
+DHCP e mitmproxy hanno **script separati**, con una dipendenza a senso unico:
+- `start-dhcp.sh` è **autonomo**: gestisce solo `mitm-dhcp` e l'anchor `com.mitm.dhcp`, non sa nulla di mitmproxy. Con il solo DHCP attivo i client hanno il Mac come gateway e navigano via NAT, senza intercettazione.
+- `start-mitm.sh` **dipende dal DHCP**: come primo passo lancia `./start-dhcp.sh`, poi gestisce `mitmproxy.test` e l'anchor `com.mitm.route`.
+
+Entrambi sono **idempotenti** e si possono rilanciare in qualsiasi momento:
+- container **inesistente** → lo crea con `container run` (per mitmproxy è l'unico momento in cui viene letta `MITM_WEB_PASSWORD`, default `password`);
 - container **fermo** → `container start`;
 - container **in esecuzione** → nessuna azione sul container.
 
-Poi attende che gli IP siano assegnati (fino a ~10s ciascuno), ricava il bridge e rigenera i due anchor pf (`com.mitm.route` e `com.mitm.dhcp`).
+Poi attendono che l'IP sia assegnato (fino a ~10s), e rigenerano e ricaricano il proprio anchor; `start-mitm.sh` ricava anche il bridge.
 
-Va eseguito **senza sudo davanti a tutto**: `container run/inspect` richiedono la sessione utente; solo la scrittura dei file e il reload pf sono elevati. Lo script si porta nella propria directory (`cd "$(dirname "$0")"`), quindi i volumi relativi (`./mitmproxy`, `./dhcp`) funzionano da qualunque directory lo si lanci.
+Vanno eseguiti **senza sudo** (`container run/inspect` richiedono la sessione utente) e non chiedono privilegi: invece di scrivere gli anchor, scrivono l'IP corrente in un file di stato in `/usr/local/var/mitm-pf/` (`dhcp` / `route`) e attendono (fino a ~10s) che il LaunchDaemon di root `com.mitm.pf` abbia applicato la regola (punto 9). Si portano nella propria directory (`cd "$(dirname "$0")"`), quindi i volumi relativi (`./mitmproxy`, `./dhcp`) funzionano da qualunque directory li si lanci.
 
+Le funzioni comuni (`start_existing`, `container_net`, `write_state`, `wait_anchor`) sono **duplicate** nei due script invece che in un file condiviso: così `start-dhcp.sh` non dipende da nient'altro del progetto.
+
+`start-dhcp.sh`:
 ```bash
 #!/bin/bash
 set -euo pipefail
 
-# Da eseguire SENZA sudo: container run/inspect richiedono la sessione utente.
-# Solo la scrittura degli anchor e il reload di pf sono elevati.
+# Avvia il DHCP della LAN (dnsmasq nel container mitm-dhcp) e la regola pf che
+# gli inoltra le richieste del relay del router. Autonomo: non dipende da
+# mitmproxy, e i client navigano via NAT del Mac anche senza intercettazione.
 #
-# Uso: ./start-mitm.sh
-#      MITM_WEB_PASSWORD='<password>' ./start-mitm.sh
-# Password della web UI: default 'password'. Serve solo alla creazione del
-# container; nei rilanci successivi (container già esistente) viene ignorata.
+# Nessun sudo: lo script scrive l'IP del container in /usr/local/var/mitm-pf/dhcp
+# e il LaunchDaemon di root com.mitm.pf rigenera l'anchor com.mitm.dhcp.
+#
+# Uso: ./start-dhcp.sh
 
-# I volumi usano percorsi relativi alla directory del progetto
+# Il volume usa un percorso relativo alla directory del progetto
 cd "$(dirname "$0")"
 
-# Dominio DNS locale di container (creato una volta con
-# `sudo container system dns create test`). Il DNS integrato risolve solo i
-# container il cui nome è <nome>.<dominio>: sul Mac la web UI è raggiungibile
-# come http://mitmproxy.test:8081, qualunque sia l'IP corrente.
-DNS_DOMAIN=test
-NAME="mitmproxy.$DNS_DOMAIN"
-IMAGE=mitm-transparent
 DHCP_NAME=mitm-dhcp
 DHCP_IMAGE=mitm-dhcp
-ROUTER=192.168.3.1        # router/AP con DHCP relay verso il Mac
-MAC_LAN_IP=192.168.3.2    # IP del Mac su en7, destinazione del relay
+STATE=/usr/local/var/mitm-pf
+ANCHOR=/etc/pf.anchors/com.mitm.dhcp
 
 # Avvia un container esistente se è fermo. Ritorna 1 se il container non esiste.
 start_existing() {
@@ -182,6 +185,133 @@ container_net() {
   return 1
 }
 
+# Scrive il file di stato per il daemon (rename atomico: il daemon, attivato
+# da WatchPaths sulla directory, non legge mai un file scritto a metà)
+write_state() {
+  printf '%s\n' "$2" > "$STATE/.$1.tmp"
+  mv "$STATE/.$1.tmp" "$STATE/$1"
+}
+
+# Attende che il daemon abbia applicato la regola: anchor che contiene $2,
+# o vuoto se $2 è vuoto. Fino a ~10s.
+wait_anchor() {
+  for _ in $(seq 1 20); do
+    if [ -z "$2" ]; then
+      [ ! -s "$1" ] && return 0
+    else
+      grep -qF -- "$2" "$1" 2> /dev/null && return 0
+    fi
+    sleep 0.5
+  done
+  echo "Il daemon com.mitm.pf non ha aggiornato $1: vedi /var/log/mitm-pf.log" >&2
+  return 1
+}
+
+# dnsmasq: crea il container se non esiste, lo avvia se è fermo.
+# Configurazione e lease in ./dhcp. NET_ADMIN è richiesta da dnsmasq per il
+# DHCP (altrimenti esce all'avvio).
+if ! start_existing "$DHCP_NAME"; then
+  echo "Creo il container $DHCP_NAME"
+  container run -d --name "$DHCP_NAME" \
+    --cap-add NET_ADMIN \
+    --volume ./dhcp:/data \
+    "$DHCP_IMAGE" > /dev/null
+fi
+
+NET=$(container_net "$DHCP_NAME")
+read -r DHCP_IP _ <<<"$NET"
+
+echo "IP DHCP: $DHCP_IP"
+
+# Richieste del relay DHCP del router → dnsmasq (regola rdr generata dal daemon)
+write_state dhcp "$DHCP_IP"
+wait_anchor "$ANCHOR" "-> $DHCP_IP port 67"
+echo "Regola pf DHCP applicata"
+```
+
+`start-mitm.sh`:
+```bash
+#!/bin/bash
+set -euo pipefail
+
+# Avvia mitmproxy (container mitmproxy.test) e la regola pf che gli instrada
+# l'HTTP/HTTPS dei client LAN. Dipende dal DHCP (che assegna il Mac come
+# gateway ai client): lo avvia prima con start-dhcp.sh, idempotente.
+#
+# Nessun sudo: lo script scrive bridge e IP del container in
+# /usr/local/var/mitm-pf/route e il LaunchDaemon di root com.mitm.pf rigenera
+# l'anchor com.mitm.route.
+#
+# Uso: ./start-mitm.sh
+#      MITM_WEB_PASSWORD='<password>' ./start-mitm.sh
+# Password della web UI: default 'password'. Serve solo alla creazione del
+# container; nei rilanci successivi (container già esistente) viene ignorata.
+
+# Il volume usa un percorso relativo alla directory del progetto
+cd "$(dirname "$0")"
+
+# Dipendenza: DHCP attivo
+./start-dhcp.sh
+
+# Dominio DNS locale di container (creato una volta con
+# `sudo container system dns create test`). Il DNS integrato risolve solo i
+# container il cui nome è <nome>.<dominio>: sul Mac la web UI è raggiungibile
+# come http://mitmproxy.test:8081, qualunque sia l'IP corrente.
+DNS_DOMAIN=test
+NAME="mitmproxy.$DNS_DOMAIN"
+IMAGE=mitm-transparent
+STATE=/usr/local/var/mitm-pf
+ANCHOR=/etc/pf.anchors/com.mitm.route
+
+# Avvia un container esistente se è fermo. Ritorna 1 se il container non esiste.
+start_existing() {
+  container inspect "$1" > /dev/null 2>&1 || return 1
+  if [ "$(container inspect "$1" | jq -r '.[0].status.state')" != "running" ]; then
+    echo "Avvio il container $1"
+    container start "$1" > /dev/null
+  fi
+}
+
+# Stampa "IP GATEWAY" del container. L'IP viene assegnato poco dopo l'avvio:
+# attende fino a ~10s.
+container_net() {
+  local info ip gw
+  for _ in $(seq 1 20); do
+    info=$(container inspect "$1")
+    ip=$(jq -r '.[0].status.networks[0].ipv4Address // empty' <<<"$info" | cut -d'/' -f1)
+    gw=$(jq -r '.[0].status.networks[0].ipv4Gateway // empty' <<<"$info")
+    if [ -n "$ip" ] && [ -n "$gw" ]; then
+      echo "$ip $gw"
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "Impossibile determinare IP/gateway del container $1" >&2
+  return 1
+}
+
+# Scrive il file di stato per il daemon (rename atomico: il daemon, attivato
+# da WatchPaths sulla directory, non legge mai un file scritto a metà)
+write_state() {
+  printf '%s\n' "$2" > "$STATE/.$1.tmp"
+  mv "$STATE/.$1.tmp" "$STATE/$1"
+}
+
+# Attende che il daemon abbia applicato la regola: anchor che contiene $2,
+# o vuoto se $2 è vuoto. Fino a ~10s.
+wait_anchor() {
+  for _ in $(seq 1 20); do
+    if [ -z "$2" ]; then
+      [ ! -s "$1" ] && return 0
+    else
+      grep -qF -- "$2" "$1" 2> /dev/null && return 0
+    fi
+    sleep 0.5
+  done
+  echo "Il daemon com.mitm.pf non ha aggiornato $1: vedi /var/log/mitm-pf.log" >&2
+  return 1
+}
+
 # mitmproxy: crea il container se non esiste, lo avvia se è fermo
 if ! start_existing "$NAME"; then
   echo "Creo il container $NAME"
@@ -193,20 +323,8 @@ if ! start_existing "$NAME"; then
     "$IMAGE" > /dev/null
 fi
 
-# DHCP (dnsmasq): stesso schema, configurazione e lease in ./dhcp.
-# NET_ADMIN è richiesta da dnsmasq per il DHCP (altrimenti esce all'avvio).
-if ! start_existing "$DHCP_NAME"; then
-  echo "Creo il container $DHCP_NAME"
-  container run -d --name "$DHCP_NAME" \
-    --cap-add NET_ADMIN \
-    --volume ./dhcp:/data \
-    "$DHCP_IMAGE" > /dev/null
-fi
-
 NET=$(container_net "$NAME")
 read -r CONTAINER_IP GATEWAY <<<"$NET"
-NET=$(container_net "$DHCP_NAME")
-read -r DHCP_IP _ <<<"$NET"
 
 # Bridge vmnet = interfaccia del Mac che ha l'IP del gateway (es. bridge100)
 BRIDGE=$(ifconfig | awk -v gw="$GATEWAY" '
@@ -218,23 +336,13 @@ if [ -z "$BRIDGE" ]; then
   exit 1
 fi
 
-echo "IP mitmproxy: $CONTAINER_IP  IP DHCP: $DHCP_IP  bridge: $BRIDGE"
+echo "IP mitmproxy: $CONTAINER_IP  bridge: $BRIDGE"
 
-# HTTP/HTTPS dei client LAN → mitmproxy (instradato, destinazione invariata)
-sudo tee /etc/pf.anchors/com.mitm.route > /dev/null <<EOF
-pass in quick on en7 route-to ($BRIDGE $CONTAINER_IP) inet proto tcp from 192.168.3.0/24 to any port { 80, 443 } keep state
-EOF
-
-# Richieste del relay DHCP del router → dnsmasq (qui basta rdr: dnsmasq non
-# ha bisogno della destinazione originale)
-sudo tee /etc/pf.anchors/com.mitm.dhcp > /dev/null <<EOF
-rdr on en7 inet proto udp from $ROUTER to $MAC_LAN_IP port 67 -> $DHCP_IP port 67
-EOF
-
-sudo pfctl -a com.mitm.route -f /etc/pf.anchors/com.mitm.route
-sudo pfctl -a com.mitm.dhcp -f /etc/pf.anchors/com.mitm.dhcp
-sudo pfctl -s info | grep -q 'Status: Enabled' || sudo pfctl -E
-echo "Regole pf aggiornate e ricaricate"
+# HTTP/HTTPS dei client LAN → mitmproxy (instradato, destinazione invariata;
+# regola route-to generata dal daemon)
+write_state route "$BRIDGE $CONTAINER_IP"
+wait_anchor "$ANCHOR" "route-to ($BRIDGE $CONTAINER_IP)"
+echo "Regola pf mitmproxy applicata"
 ```
 
 ### 4. Container — immagine (`Containerfile`)
@@ -309,7 +417,7 @@ done
 
 ### 6. Container DHCP (`dhcp/`)
 
-Container separato `mitm-dhcp` con `dnsmasq`, raggiunto dal relay del router tramite l'`rdr` di pf (vedi *Flusso del traffico*). È separato da `mitmproxy.test` perché ha un ciclo di vita diverso: `stop-mitm.sh` ferma l'intercettazione ma lascia attivo il DHCP, così i client continuano a ricevere/rinnovare il lease e navigano via NAT del Mac.
+Container separato `mitm-dhcp` con `dnsmasq`, raggiunto dal relay del router tramite l'`rdr` di pf (vedi *Flusso del traffico*). È separato da `mitmproxy.test` perché ha un ciclo di vita diverso, con script propri (`start-dhcp.sh` / `stop-dhcp.sh`) che non dipendono da mitmproxy: `stop-mitm.sh` ferma l'intercettazione ma lascia attivo il DHCP, così i client continuano a ricevere/rinnovare il lease e navigano via NAT del Mac.
 
 Alternative scartate:
 - **DHCP server su macOS** (`dnsmasq`/`kea` da brew): processo in ascolto sul Mac, bloccato dall'Application Firewall come mitmproxy (cronologia, punto 2).
@@ -368,22 +476,24 @@ Setup una tantum del dominio DNS locale di `container` (vedi *Web UI dal Mac*):
 sudo container system dns create test
 ```
 
-I container vengono creati/avviati da `start-mitm.sh` (punto 3), sulla rete `default` (nessun `--network`):
+I container vengono creati/avviati dagli script del punto 3, sulla rete `default` (nessun `--network`):
 ```bash
 container build -t mitm-transparent .
 container build -t mitm-dhcp dhcp/
-./start-mitm.sh
+./start-mitm.sh          # avvia anche il DHCP
 ```
+Solo DHCP (i client navigano via NAT, senza intercettazione): `./start-dhcp.sh`.
+
 Password della web UI: `password`, oppure `MITM_WEB_PASSWORD='<password>' ./start-mitm.sh`.
 
-Dopo un riavvio (`container stop`, reboot del Mac) basta rieseguire `./start-mitm.sh`: riavvia i container fermi e aggiorna le regole pf.
+Dopo un riavvio (`container stop`, reboot del Mac) basta rieseguire `./start-mitm.sh`: riavvia i container fermi e aggiorna le regole pf. Dopo un **reboot del Mac** i servizi di `container` non ripartono da soli (`apiserver is not running and not registered with launchd`): prima va lanciato `container system start` (vedi *Limiti noti*).
 
-Per cambiare password o immagine (dopo un nuovo `container build`) il container va ricreato, perché lo script non tocca un container esistente:
+Per cambiare password o immagine (dopo un nuovo `container build`) il container va ricreato, perché gli script non toccano un container esistente:
 ```bash
 ./stop-mitm.sh --rm
 MITM_WEB_PASSWORD='<password>' ./start-mitm.sh
 ```
-(`--rm --all` per ricreare anche il container DHCP.)
+Per il container DHCP: `./stop-dhcp.sh --rm && ./start-dhcp.sh`.
 
 #### Web UI dal Mac: `http://mitmproxy.test:8081`
 
@@ -408,92 +518,375 @@ Note:
 - Una directory dedicata evita che il container carichi `~/.mitmproxy/config.yaml` dell'uso sul Mac (con i suoi `ignore_hosts`, `ssl_insecure`, …). Un eventuale `config.yaml` in `./mitmproxy` viene caricato: le opzioni da riga di comando (`mode`, `listen_port`, `web_port`, …) hanno la precedenza, tutto il resto viene applicato.
 - `MITM_WEB_PASSWORD` in chiaro è visibile in `container inspect mitmproxy.test` e nella lista processi del container. Per evitarlo, `web_password` accetta anche un hash argon2 (mitmweb stesso lo suggerisce all'avvio).
 
-### 8. Arresto (`stop-mitm.sh`)
+### 8. Arresto (`stop-mitm.sh`, `stop-dhcp.sh`)
 
-Fermare solo il container **non basta**: la regola `route-to` resterebbe attiva e il traffico 80/443 dei client su `en7` verrebbe instradato verso un IP non più in ascolto (HTTP/HTTPS bloccati per tutta la LAN). Lo script:
-- ferma `mitmproxy.test` se è in esecuzione;
-- **svuota il file** `/etc/pf.anchors/com.mitm.route`, così un reload di `/etc/pf.conf` (es. al riavvio del Mac) non ripristina la vecchia regola;
-- svuota subito l'anchor in pf (`pfctl -a com.mitm.route -F rules`);
-- chiude gli stati pf dei client LAN (`pfctl -k 192.168.3.0/24`), altrimenti le connessioni già aperte resterebbero instradate verso il container fino alla scadenza.
+Come per l'avvio, due script separati. `stop-mitm.sh` **non ferma il DHCP**: i client mantengono il Mac come gateway e navigano via NAT, senza intercettazione. Per fermare tutto:
+```bash
+./stop-mitm.sh && ./stop-dhcp.sh
+```
 
-Il **DHCP resta attivo** per default: i client mantengono il Mac come gateway e navigano via NAT, senza intercettazione.
+Fermare solo il container **non basta**: la regola pf resterebbe attiva verso un IP non più in ascolto (con `route-to`, HTTP/HTTPS bloccati per tutta la LAN). Ogni script:
+- ferma il proprio container se è in esecuzione (con `--rm` lo rimuove anche — necessario per cambiare password o immagine);
+- svuota il proprio file di stato; il daemon `com.mitm.pf` (punto 9) allora:
+  - **svuota il file** dell'anchor (`/etc/pf.anchors/com.mitm.route` o `com.mitm.dhcp`), così un reload di `/etc/pf.conf` (es. al riavvio del Mac) non ripristina la vecchia regola;
+  - svuota subito l'anchor in pf (`-F rules` per il `route-to`, `-F nat` per l'`rdr`: le `rdr` sono regole di traduzione, `-F rules` non le toccherebbe);
+  - chiude gli stati pf legati alla vecchia regola: per mitmproxy quelli dei client LAN (`pfctl -k 192.168.3.0/24`, include anche gli stati del relay DHCP, che si ricreano al pacchetto successivo), per il DHCP solo quelli relay → Mac (`pfctl -k 192.168.3.1 -k 192.168.3.2`).
 
-Opzioni (combinabili):
-- `--all`: ferma anche `mitm-dhcp` e svuota l'anchor `com.mitm.dhcp` (con `-F nat`: le `rdr` sono regole di traduzione, `-F rules` non le toccherebbe). Da usare quando si smette di usare il Mac come gateway: i client non potranno rinnovare il lease, quindi va rimesso il router in modalità DHCP server.
-- `--rm`: rimuove anche i container fermati (necessario per cambiare password o immagine).
+Dopo `stop-dhcp.sh` i client non possono rinnovare il lease: se il Mac smette di fare da gateway, va rimesso il router in modalità DHCP server.
 
-Come `start-mitm.sh`, va eseguito **senza sudo davanti a tutto**. Si può rilanciare anche se i container sono già fermi o non esistono.
+Come gli script di avvio, vanno eseguiti **senza sudo** e non chiedono privilegi. Si possono rilanciare anche se i container sono già fermi o non esistono.
 
+`stop-mitm.sh`:
 ```bash
 #!/bin/bash
 set -euo pipefail
 
-# Da eseguire SENZA sudo: container stop/rm richiedono la sessione utente.
-# Solo lo svuotamento degli anchor e la pulizia degli stati pf sono elevati.
+# Ferma mitmproxy e rimuove la regola pf route-to. Il DHCP resta attivo: i
+# client mantengono il Mac come gateway e navigano via NAT, senza
+# intercettazione. Per fermare anche il DHCP: ./stop-dhcp.sh
 #
-# Uso: ./stop-mitm.sh              ferma mitmproxy e rimuove la regola route-to;
-#                                  il DHCP resta attivo (i client navigano via NAT)
-#      ./stop-mitm.sh --all        ferma anche il DHCP e rimuove la regola rdr
-#      ./stop-mitm.sh --rm [...]   rimuove anche i container fermati
-#                                  (necessario per cambiare password o immagine)
+# Nessun sudo: lo script svuota /usr/local/var/mitm-pf/route e il LaunchDaemon
+# di root com.mitm.pf svuota l'anchor com.mitm.route e chiude gli stati dei client.
+#
+# Uso: ./stop-mitm.sh         ferma il container e rimuove la regola route-to
+#      ./stop-mitm.sh --rm    rimuove anche il container
+#                             (necessario per cambiare password o immagine)
 
 NAME=mitmproxy.test   # deve coincidere con NAME di start-mitm.sh
-DHCP_NAME=mitm-dhcp
+STATE=/usr/local/var/mitm-pf
+ANCHOR=/etc/pf.anchors/com.mitm.route
 
 REMOVE=false
-ALL=false
 for arg in "$@"; do
   case "$arg" in
-    --rm)  REMOVE=true ;;
-    --all) ALL=true ;;
-    *)     echo "Opzione sconosciuta: $arg"; exit 1 ;;
+    --rm) REMOVE=true ;;
+    *)    echo "Opzione sconosciuta: $arg"; exit 1 ;;
   esac
 done
 
-# Ferma il container se in esecuzione, lo rimuove solo con --rm
-stop_container() {
-  if container inspect "$1" > /dev/null 2>&1; then
-    if [ "$(container inspect "$1" | jq -r '.[0].status.state')" = "running" ]; then
-      echo "Fermo il container $1"
-      container stop "$1" > /dev/null
-    fi
-    if [ "$REMOVE" = true ]; then
-      echo "Rimuovo il container $1"
-      container rm "$1" > /dev/null
-    fi
-  else
-    echo "Container $1 non presente"
-  fi
+# Scrive il file di stato per il daemon (rename atomico)
+write_state() {
+  printf '%s\n' "$2" > "$STATE/.$1.tmp"
+  mv "$STATE/.$1.tmp" "$STATE/$1"
 }
 
-stop_container "$NAME"
+# Attende che il daemon abbia applicato la regola: anchor che contiene $2,
+# o vuoto se $2 è vuoto. Fino a ~10s.
+wait_anchor() {
+  for _ in $(seq 1 20); do
+    if [ -z "$2" ]; then
+      [ ! -s "$1" ] && return 0
+    else
+      grep -qF -- "$2" "$1" 2> /dev/null && return 0
+    fi
+    sleep 0.5
+  done
+  echo "Il daemon com.mitm.pf non ha aggiornato $1: vedi /var/log/mitm-pf.log" >&2
+  return 1
+}
 
-# Regola pf: file vuoto (così un reload di /etc/pf.conf non la ripristina)
-# e anchor svuotato subito. Senza questo, il traffico 80/443 dei client LAN
-# resterebbe instradato verso un IP non più attivo.
-sudo tee /etc/pf.anchors/com.mitm.route < /dev/null > /dev/null
-sudo pfctl -a com.mitm.route -F rules 2> /dev/null
-
-if [ "$ALL" = true ]; then
-  stop_container "$DHCP_NAME"
-  sudo tee /etc/pf.anchors/com.mitm.dhcp < /dev/null > /dev/null
-  sudo pfctl -a com.mitm.dhcp -F nat 2> /dev/null   # rdr = regole di traduzione
+if container inspect "$NAME" > /dev/null 2>&1; then
+  if [ "$(container inspect "$NAME" | jq -r '.[0].status.state')" = "running" ]; then
+    echo "Fermo il container $NAME"
+    container stop "$NAME" > /dev/null
+  fi
+  if [ "$REMOVE" = true ]; then
+    echo "Rimuovo il container $NAME"
+    container rm "$NAME" > /dev/null
+  fi
+else
+  echo "Container $NAME non presente"
 fi
 
-# Chiude le connessioni dei client LAN ancora legate alle vecchie regole
-sudo pfctl -k 192.168.3.0/24 2> /dev/null
+# Regola pf rimossa dal daemon (anche dal file, così un reload di
+# /etc/pf.conf non la ripristina). Senza questo, il traffico 80/443 dei
+# client LAN resterebbe instradato verso un IP non più attivo.
+write_state route ""
+wait_anchor "$ANCHOR" ""
 
 echo "Intercettazione disattivata: i client LAN escono su Internet via NAT su en0"
-if [ "$ALL" = true ]; then
-  echo "DHCP fermo: i client non rinnovano il lease (ripristinare il DHCP server sul router se serve)"
-fi
 ```
 
-Dopo l'arresto i client LAN continuano a navigare direttamente (NAT su `en0`, anchor `com.mitm.nat`), senza mitmproxy. Per riprendere: `./start-mitm.sh`.
+`stop-dhcp.sh`:
+```bash
+#!/bin/bash
+set -euo pipefail
 
-Lo script lascia volutamente attivi:
+# Ferma il DHCP della LAN e rimuove la regola pf del relay. Autonomo: non
+# tocca mitmproxy. Senza DHCP i client non ottengono né rinnovano il lease:
+# se il Mac smette di fare da gateway, rimettere il router in modalità DHCP server.
+#
+# Nessun sudo: lo script svuota /usr/local/var/mitm-pf/dhcp e il LaunchDaemon
+# di root com.mitm.pf svuota l'anchor com.mitm.dhcp e chiude gli stati relay → Mac.
+#
+# Uso: ./stop-dhcp.sh         ferma il container e rimuove la regola rdr
+#      ./stop-dhcp.sh --rm    rimuove anche il container (es. dopo un rebuild)
+
+DHCP_NAME=mitm-dhcp
+STATE=/usr/local/var/mitm-pf
+ANCHOR=/etc/pf.anchors/com.mitm.dhcp
+
+REMOVE=false
+for arg in "$@"; do
+  case "$arg" in
+    --rm) REMOVE=true ;;
+    *)    echo "Opzione sconosciuta: $arg"; exit 1 ;;
+  esac
+done
+
+# Scrive il file di stato per il daemon (rename atomico)
+write_state() {
+  printf '%s\n' "$2" > "$STATE/.$1.tmp"
+  mv "$STATE/.$1.tmp" "$STATE/$1"
+}
+
+# Attende che il daemon abbia applicato la regola: anchor che contiene $2,
+# o vuoto se $2 è vuoto. Fino a ~10s.
+wait_anchor() {
+  for _ in $(seq 1 20); do
+    if [ -z "$2" ]; then
+      [ ! -s "$1" ] && return 0
+    else
+      grep -qF -- "$2" "$1" 2> /dev/null && return 0
+    fi
+    sleep 0.5
+  done
+  echo "Il daemon com.mitm.pf non ha aggiornato $1: vedi /var/log/mitm-pf.log" >&2
+  return 1
+}
+
+if container inspect "$DHCP_NAME" > /dev/null 2>&1; then
+  if [ "$(container inspect "$DHCP_NAME" | jq -r '.[0].status.state')" = "running" ]; then
+    echo "Fermo il container $DHCP_NAME"
+    container stop "$DHCP_NAME" > /dev/null
+  fi
+  if [ "$REMOVE" = true ]; then
+    echo "Rimuovo il container $DHCP_NAME"
+    container rm "$DHCP_NAME" > /dev/null
+  fi
+else
+  echo "Container $DHCP_NAME non presente"
+fi
+
+# Regola pf rimossa dal daemon (anche dal file, così un reload di
+# /etc/pf.conf non la ripristina)
+write_state dhcp ""
+wait_anchor "$ANCHOR" ""
+
+echo "DHCP fermo: i client non rinnovano il lease (ripristinare il DHCP server sul router se serve)"
+```
+
+Per riprendere: `./start-mitm.sh` (riavvia anche il DHCP se serve), oppure `./start-dhcp.sh` per il solo DHCP.
+
+Gli script lasciano volutamente attivi:
 - **pf**: non si usa `pfctl -d`, che lo disabiliterebbe per tutto il sistema (inclusi servizi macOS/MDM che lo usano); con gli anchor vuoti pf non ha effetti sul traffico LAN;
 - **IP forwarding**: spegnerlo (`sudo sysctl -w net.inet.ip.forwarding=0`, e rimuovere la riga da `/etc/sysctl.conf` per renderlo permanente) toglie Internet ai client LAN.
+
+### 9. Regole pf senza sudo e avvio al login (`daemon/`, `launchagent/`)
+
+Gli script utente non possono aggiornare pf da soli (serve root, con prompt BeyondTrust a ogni `sudo`), e al login non c'è nessuno a confermare un prompt. La parte privilegiata è quindi separata in un **LaunchDaemon di root**, installato una volta sola:
+
+```
+script utente ──scrive IP──▶ /usr/local/var/mitm-pf/{route,dhcp}   (utente)
+                                   │ launchd WatchPaths
+                                   ▼
+                     com.mitm.pf (root): valida, rigenera /etc/pf.anchors/com.mitm.{route,dhcp},
+                                         pfctl -a <anchor> -f|-F, pfctl -k, pfctl -E se serve
+```
+
+- **File di stato** (scritti con rename atomico, così il daemon non legge mai un file a metà):
+  - `route` → `<bridge> <IP mitmproxy>` (vuoto = nessuna intercettazione);
+  - `dhcp` → `<IP dnsmasq>` (vuoto = nessun DHCP).
+- **Validazione**: il contenuto è scrivibile dall'utente, quindi non viene mai eseguito né copiato così com'è; il daemon accetta solo `bridge<N>` e indirizzi IPv4 (regex) e genera la regola da un modello fisso. Qualsiasi altro contenuto svuota la regola.
+- **Script di root in `/usr/local/libexec/mitm-pf-apply`** (root:wheel, 755), non nella directory del progetto: altrimenti chi può scrivere nel progetto potrebbe far eseguire codice a root.
+- **Nessun reload inutile**: l'anchor viene ricaricato (e gli stati chiusi) solo se la regola cambia.
+- **Al boot** (`RunAtLoad`): i file di stato **precedenti all'ultimo boot** (`kern.boottime`) sono ignorati, quindi le regole della sessione precedente vengono svuotate. Risolve il `route-to` verso un IP inesistente rimasto dopo un riavvio con mitmproxy attivo.
+- Log: `/var/log/mitm-pf.log`.
+
+`daemon/mitm-pf-apply`:
+```bash
+#!/bin/bash
+# Eseguito da root via LaunchDaemon com.mitm.pf (installato in
+# /usr/local/libexec). Legge gli IP scritti dagli script utente in
+# /usr/local/var/mitm-pf/ e rigenera gli anchor pf. I file di stato sono
+# scrivibili dall'utente: il contenuto viene validato, mai eseguito.
+#
+#   route  →  "<bridge> <IP mitmproxy>"   (vuoto/assente = nessuna intercettazione)
+#   dhcp   →  "<IP dnsmasq>"              (vuoto/assente = nessun DHCP)
+#
+# File più vecchi dell'ultimo boot sono ignorati: dopo un riavvio i container
+# sono fermi e le regole della sessione precedente vanno svuotate.
+set -u
+
+STATE=/usr/local/var/mitm-pf
+ANCHORS=/etc/pf.anchors
+ROUTER=192.168.3.1
+MAC_LAN_IP=192.168.3.2
+IP_RE='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+IF_RE='^bridge[0-9]{1,3}$'
+
+# "{ sec = 1790839610, usec = 680084 } ..." → 1790839610
+BOOT=$(sysctl -n kern.boottime | sed -E 's/^\{ sec = ([0-9]+),.*/\1/')
+
+# Contenuto del file di stato, vuoto se assente o precedente al boot
+read_state() {
+  local f="$STATE/$1"
+  [ -f "$f" ] || return 0
+  [ "$(stat -f %m "$f")" -ge "$BOOT" ] || return 0
+  head -c 64 "$f" | head -n 1
+}
+
+# Scrive l'anchor solo se cambia; ritorna 0 se è cambiato
+write_anchor() {
+  local file="$ANCHORS/$1" new="$2"
+  [ -f "$file" ] && [ "$(cat "$file")" = "$new" ] && return 1
+  printf '%s' "$new" > "$file"
+  [ -n "$new" ] && printf '\n' >> "$file"
+  return 0
+}
+
+# --- mitmproxy: route-to ---
+read -r BRIDGE MITM_IP _ <<<"$(read_state route)"
+RULE=""
+if [[ ${BRIDGE:-} =~ $IF_RE ]] && [[ ${MITM_IP:-} =~ $IP_RE ]]; then
+  RULE="pass in quick on en7 route-to ($BRIDGE $MITM_IP) inet proto tcp from 192.168.3.0/24 to any port { 80, 443 } keep state"
+fi
+if write_anchor com.mitm.route "$RULE"; then
+  if [ -n "$RULE" ]; then
+    pfctl -a com.mitm.route -f "$ANCHORS/com.mitm.route"
+  else
+    pfctl -a com.mitm.route -F rules
+  fi
+  # Connessioni dei client ancora legate alla regola precedente
+  pfctl -k 192.168.3.0/24
+fi
+
+# --- DHCP: rdr del relay ---
+read -r DHCP_IP _ <<<"$(read_state dhcp)"
+RULE=""
+if [[ ${DHCP_IP:-} =~ $IP_RE ]]; then
+  RULE="rdr on en7 inet proto udp from $ROUTER to $MAC_LAN_IP port 67 -> $DHCP_IP port 67"
+fi
+if write_anchor com.mitm.dhcp "$RULE"; then
+  if [ -n "$RULE" ]; then
+    pfctl -a com.mitm.dhcp -f "$ANCHORS/com.mitm.dhcp"
+  else
+    pfctl -a com.mitm.dhcp -F nat
+  fi
+  pfctl -k "$ROUTER" -k "$MAC_LAN_IP"
+fi
+
+pfctl -s info | grep -q 'Status: Enabled' || pfctl -E
+exit 0
+```
+
+`daemon/com.mitm.pf.plist`:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mitm.pf</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/mitm-pf-apply</string>
+    </array>
+    <!-- Al boot: svuota le regole della sessione precedente -->
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- A ogni modifica dei file di stato scritti dagli script utente -->
+    <key>WatchPaths</key>
+    <array>
+        <string>/usr/local/var/mitm-pf</string>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/var/log/mitm-pf.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/mitm-pf.log</string>
+</dict>
+</plist>
+```
+
+Installazione (una volta, da amministratore):
+```bash
+sudo ./daemon/install.sh
+```
+`daemon/install.sh`:
+```bash
+#!/bin/bash
+# Installazione una tantum del LaunchDaemon com.mitm.pf (richiede admin):
+#   sudo ./daemon/install.sh
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+USER_NAME="${SUDO_USER:?Lanciare con sudo da utente normale}"
+
+# Script eseguito da root: in una directory di root, non modificabile dall'utente
+install -d -o root -g wheel -m 755 /usr/local/libexec
+install -o root -g wheel -m 755 mitm-pf-apply /usr/local/libexec/mitm-pf-apply
+
+# Directory dei file di stato: scrivibile dall'utente, letta dal daemon
+install -d -o "$USER_NAME" -g staff -m 755 /usr/local/var/mitm-pf
+
+install -o root -g wheel -m 644 com.mitm.pf.plist /Library/LaunchDaemons/com.mitm.pf.plist
+
+launchctl bootout system/com.mitm.pf 2> /dev/null || true
+launchctl bootstrap system /Library/LaunchDaemons/com.mitm.pf.plist
+
+echo "LaunchDaemon com.mitm.pf installato. Log: /var/log/mitm-pf.log"
+```
+
+Verifica: `sudo launchctl print system/com.mitm.pf | grep -E 'state|last exit'`.
+
+#### Avvio del DHCP al login (LaunchAgent `com.mitm.dhcp`)
+
+I servizi di `container` sono job launchd della **sessione utente**: dopo un reboot non sono registrati (`apiserver is not running and not registered with launchd`) e prima del login non possono girare. Il LaunchAgent, a ogni login, lancia `container system start` (idempotente: con i servizi già attivi termina con successo) e poi `start-dhcp.sh`. mitmproxy **non** parte al login: si avvia a mano con `./start-mitm.sh`.
+
+`launchagent/com.mitm.dhcp.plist`:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Avvio del DHCP al login (LaunchAgent utente, nessun privilegio).
+  Dopo un reboot i servizi di container non sono registrati: prima
+  container system start (idempotente), poi start-dhcp.sh.
+  Installazione: ./launchagent/install.sh
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mitm.dhcp</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>container system start &amp;&amp; exec /Users/f.gasperini/test/start-dhcp.sh</string>
+    </array>
+    <!-- container è in /usr/local/bin, assente dal PATH di default di launchd -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/f.gasperini/Library/Logs/mitm-dhcp.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/f.gasperini/Library/Logs/mitm-dhcp.log</string>
+</dict>
+</plist>
+```
+
+Installazione (utente normale, senza sudo) e rimozione:
+```bash
+./launchagent/install.sh
+./launchagent/install.sh --remove
+```
+
+Log: `~/Library/Logs/mitm-dhcp.log`. Stato: `launchctl print gui/$(id -u)/com.mitm.dhcp | grep -E 'state|last exit'`.
 
 ## Problemi diagnosticati durante la costruzione (cronologia)
 
@@ -512,10 +905,13 @@ Lo script lascia volutamente attivi:
 13. **Container DHCP che si ferma subito dopo l'avvio** → `dnsmasq` richiede `NET_ADMIN` per il DHCP. Risolto con `--cap-add NET_ADMIN` anche su `mitm-dhcp`.
 14. **DHCP ok ma il telefono non naviga** → mitmweb riceveva le connessioni (`192.168.3.168`) ma andava in timeout verso tutti i server (`Connect call failed … Errno 110`); dal container falliva anche `curl https://example.com`. Causa: il reload completo di `/etc/pf.conf` (fatto per aggiungere `com.mitm.dhcp`) aveva rimosso gli anchor NAT inseriti a runtime da `InternetSharing` per `192.168.64.0/24`. Risolto aggiungendo `nat on en0 inet from 192.168.64.0/24 to any -> (en0)` a `com.mitm.nat` e ricaricando solo quell'anchor (`pfctl -a com.mitm.nat -f …`). Alternativa senza pf: `container system stop` / `container system start` (poi `./start-mitm.sh`), ma il problema si ripresenterebbe al successivo reload completo.
 15. **Web UI raggiungibile solo digitando l'IP del container** (che cambia a ogni riavvio) → risolto con il DNS integrato di `container` (`container system dns create test`). Il primo tentativo non risolveva nulla (NXDOMAIN) neanche per container creati con `--dns-domain test`: il DNS registra solo i container il cui nome è già `<nome>.<dominio>`. Rinominato il container da `mitm-proxy` a `mitmproxy.test`.
+16. **Dopo un reboot il telefono non navigava e nulla ripartiva** → i servizi di `container` non si registrano da soli dopo il reboot, e `com.mitm.route` conteneva ancora il `route-to` verso l'IP del container della sessione precedente (ricaricato da `pf.conf` all'avvio). Risolto con il LaunchDaemon `com.mitm.pf` (svuota al boot le regole con file di stato precedenti al boot) e il LaunchAgent `com.mitm.dhcp` (avvia `container` e il DHCP al login). Il daemon elimina anche i prompt `sudo` degli script.
 
 ## Limiti noti / cose da verificare ancora
 
 - **QUIC/HTTP3 su UDP 443** non viene intercettato (`route-to`/`REDIRECT` sono solo TCP) e, non essendoci una regola che lo blocchi, esce via NAT su `en0`. Client come Safari/Chrome su iOS possono usarlo di default per molti siti, con traffico che bypassa mitmproxy senza errori visibili. Per forzare il fallback su TCP si può aggiungere nell'heredoc dello script (l'anchor `com.mitm.route` viene rigenerato a ogni esecuzione): `block in quick on en7 inet proto udp from 192.168.3.0/24 to any port 443`.
+- **Tra boot e login niente DHCP**: i servizi di `container` girano solo nella sessione utente, quindi il DHCP parte al login (LaunchAgent, punto 9), non al boot. Prima del login i client non ottengono/rinnovano il lease. Il daemon pf invece parte al boot e svuota le regole della sessione precedente.
+- **Avvio al login provato solo con `launchctl bootstrap`**, non ancora con un vero logout/login o reboot.
 - **Il Mac è un punto singolo di guasto per la LAN**: con il DHCP in relay, a Mac spento o scollegato i client non ottengono/rinnovano il lease e non hanno gateway. Per tornare alla situazione standard: router in modalità DHCP server (i client riprendono gateway `192.168.3.1` al rinnovo successivo o riconnettendosi).
 - **Rinnovi DHCP via relay da verificare nel tempo**: il primo lease tramite il relay Zyxel funziona (iPhone → `192.168.3.168`). Non è ancora verificato che il router inoltri anche i rinnovi unicast indirizzati a `192.168.3.1`; se non lo facesse, i client rinnovano comunque in broadcast alla scadenza di T2 (~52 min con lease di 1h). Da controllare in `container logs mitm-dhcp` dopo ~30 min (T1).
 - **DNS `192.168.3.2` offerto ai client senza un servizio DNS dietro**: `dnsmasq.conf` include `192.168.3.2` come terzo DNS, ma sul Mac nessuno risponde sulla porta 53 (e il DNS di `container` ascolta solo su `127.0.0.1`). Se un client sceglie quel server, le sue query vanno in timeout finché non ripiega sugli altri.
