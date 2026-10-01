@@ -1,14 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
-# Ferma il DHCP della LAN e rimuove la regola pf del relay. Autonomo: non
-# tocca mitmproxy. Senza DHCP i client non ottengono né rinnovano il lease:
-# se il Mac smette di fare da gateway, rimettere il router in modalità DHCP server.
+# Ferma DHCP e DNS della LAN e rimuove le regole pf (relay e DNS). Autonomo:
+# non tocca mitmproxy. Senza DHCP i client non ottengono né rinnovano il lease
+# e il DNS 192.168.3.2 non risponde: se il Mac smette di fare da gateway,
+# rimettere il router in modalità DHCP server.
 #
 # Nessun sudo: lo script svuota /usr/local/var/mitm-pf/dhcp e il LaunchDaemon
-# di root com.mitm.pf svuota l'anchor com.mitm.dhcp e chiude gli stati relay → Mac.
+# di root com.mitm.pf svuota l'anchor com.mitm.dhcp e chiude gli stati LAN → Mac.
 #
-# Uso: ./stop-dhcp.sh         ferma il container e rimuove la regola rdr
+# Uso: ./stop-dhcp.sh         ferma il container e rimuove le regole rdr
 #      ./stop-dhcp.sh --rm    rimuove anche il container (es. dopo un rebuild)
 
 DHCP_NAME=mitm-dhcp
@@ -62,4 +63,4 @@ fi
 write_state dhcp ""
 wait_anchor "$ANCHOR" ""
 
-echo "DHCP fermo: i client non rinnovano il lease (ripristinare il DHCP server sul router se serve)"
+echo "DHCP e DNS fermi: i client non rinnovano il lease e non risolvono nomi (ripristinare il DHCP server sul router se serve)"

@@ -1,9 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-# Avvia il DHCP della LAN (dnsmasq nel container mitm-dhcp) e la regola pf che
-# gli inoltra le richieste del relay del router. Autonomo: non dipende da
-# mitmproxy, e i client navigano via NAT del Mac anche senza intercettazione.
+# Avvia DHCP e DNS della LAN (dnsmasq nel container mitm-dhcp) e le regole pf
+# che gli inoltrano le richieste del relay del router e le query DNS dei client
+# verso il Mac. Autonomo: non dipende da mitmproxy, e i client navigano via NAT
+# del Mac anche senza intercettazione.
 #
 # Nessun sudo: lo script scrive l'IP del container in /usr/local/var/mitm-pf/dhcp
 # e il LaunchDaemon di root com.mitm.pf rigenera l'anchor com.mitm.dhcp.
@@ -83,7 +84,8 @@ read -r DHCP_IP _ <<<"$NET"
 
 echo "IP DHCP: $DHCP_IP"
 
-# Richieste del relay DHCP del router → dnsmasq (regola rdr generata dal daemon)
+# Relay DHCP del router e query DNS dei client → dnsmasq (regole rdr generate
+# dal daemon, scritte insieme: basta attendere quella del DNS)
 write_state dhcp "$DHCP_IP"
-wait_anchor "$ANCHOR" "-> $DHCP_IP port 67"
-echo "Regola pf DHCP applicata"
+wait_anchor "$ANCHOR" "-> $DHCP_IP port 53"
+echo "Regole pf DHCP/DNS applicate"
