@@ -1,0 +1,10 @@
+- key: "z"
+  ctx: ["flowlist"]
+  cmd: view.flows.remove !~marked
+  help: Remove not marked flows
+- key: P
+  ctx: ["flowlist", "flowview"]
+  cmd: pin.marked
+- key: U
+  ctx: ["flowlist", "flowview"]
+  cmd: pin.unpin

@@ -1,0 +1,42 @@
+ssl_insecure: true
+view_order_reversed: true
+listen_host: 0.0.0.0 #192.168.3.2
+listen_port: 7070
+console_palette: lowdark
+showhost: true
+#scripts:
+#  - /Users/f.gasperini/.mitmproxy/script/send-response.py
+#  - /Users/f.gasperini/.mitmproxy/script/export.files.py
+#  - /Users/f.gasperini/.mitmproxy/script/pin_marked.py
+#  - /Users/f.gasperini/.mitmproxy/script/rewrite.py
+  #- /Users/f.gasperini/.mitmproxy/script/delay.py
+mode:
+  #- wireguard@7777
+  - transparent@7070
+  - regular@7071
+  #- reverse:https://qa.jticms.com/@3000
+  #- reverse:http://mitm.it@3333
+  #- reverse:https://qa.ploom-ambassador.gr@3001
+  #- reverse:https://qa.ploom-ambassador.it@3002
+body_size_limit: 30m
+#modify_body:
+#  - /qa\.jticms\.coms/mac.local:3000
+web_open_browser: false
+web_port: 8082
+ignore_hosts:
+  - '17\.\d+\.\d+\.\d+:443'
+  - '17\.\d+\.\d+\.\d+:5223'
+  - '^(.+\.)+?apple\.com:(80|123|443|2197|5523)$'
+  - '^(.+\.)?cdn-apple\.com:443$'
+  - '^(.+\.)?icloud-content\.com:443$'
+  - "^(.+).safebrowsing.([a-z]+):443$"
+  - '^(.+\.)?microsoft\.com:443$'
+  - '^(.+\.)?live.com:443$'
+  - '^(.+\.)?microsoftonline\.com:443$'
+  - '^(.+\.)?google\.com:443$'
+  - '^(.+\.)?googleapis\.com:443$'
+  - '^(.+\.)?a2z\.com:443$'
+  - '^(.+\.)?amazon\.com:443$'
+  - '^(.+\.)?icloud\.com:443$'
+  - '^(.+\.)?mzstatic\.com:443$'
+  - '^(.+\.)?whatsapp\.(net|com):443$'

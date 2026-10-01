@@ -1,0 +1,16 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    dnsmasq-base \
+    tini \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Configurazione e lease stanno nel volume /data (./dhcp sul Mac).
+# --user=root: dnsmasq non deve cedere i privilegi, altrimenti non può scrivere
+# il file dei lease nel volume montato.
+ENTRYPOINT ["/usr/bin/tini", "--", "dnsmasq", \
+    "--keep-in-foreground", \
+    "--log-facility=-", \
+    "--user=root", \
+    "--conf-file=/data/dnsmasq.conf", \
+    "--dhcp-leasefile=/data/dnsmasq.leases"]
