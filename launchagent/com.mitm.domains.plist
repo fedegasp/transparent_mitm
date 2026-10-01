@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Applica subito le modifiche di domini-mac.txt (LaunchAgent utente, nessun
+  privilegio): a ogni modifica copia il file nello stato del daemon
+  com.mitm.pf, che aggiorna la tabella <mitm_local>. Con l'intercettazione
+  spenta il daemon ignora l'elenco.
+  Installazione: ./launchagent/install.sh, che sostituisce __PROJECT_DIR__
+  e __HOME__ (launchd non espande ~ né $HOME).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mitm.domains</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <!-- Rename atomico, come write_state di start-mitm.sh. Percorso come $0:
+             non viene interpretato dalla shell. File assente (salvataggio
+             in corso) = nessuna modifica. -->
+        <string>S=/usr/local/var/mitm-pf; cat "$0" > "$S/.domains.tmp" &amp;&amp; mv "$S/.domains.tmp" "$S/domains"</string>
+        <string>__PROJECT_DIR__/domini-mac.txt</string>
+    </array>
+    <key>WatchPaths</key>
+    <array>
+        <string>__PROJECT_DIR__/domini-mac.txt</string>
+    </array>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/mitm-domains.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/mitm-domains.log</string>
+</dict>
+</plist>

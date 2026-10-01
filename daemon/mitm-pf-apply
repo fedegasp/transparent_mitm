@@ -47,16 +47,24 @@ write_anchor() {
   return 0
 }
 
-# IP (v4 e v6) dei domini scelti per il Mac, uno per riga, ordinati. Risolti
-# col resolver di sistema, lo stesso (e la stessa cache) dei browser.
-resolve_domains() {
-  local f="$STATE/domains" d
+# Domini scelti per il Mac, validati, uno per riga
+domain_list() {
+  local f="$STATE/domains"
   [ -f "$f" ] || return 0
   head -c 4096 "$f" | sed -E 's/#.*//; s/[[:space:]]+//g' | tr 'A-Z' 'a-z' |
-    grep -E "$DOMAIN_RE" | head -n "$MAX_DOMAINS" |
-    while read -r d; do
-      dscacheutil -q host -a name "$d" | awk '$1 == "ip_address:" || $1 == "ipv6_address:" { print $2 }'
-    done | grep -E "$IP_RE|$IP6_RE" | sort -u
+    grep -E "$DOMAIN_RE" | head -n "$MAX_DOMAINS"
+}
+
+# "<IP> <dominio>" (v4 e v6) dei domini in $1, uno per riga. Risolti col
+# resolver di sistema, lo stesso (e la stessa cache) dei browser.
+resolve_domains() {
+  local d
+  for d in $1; do
+    dscacheutil -q host -a name "$d" |
+      awk -v d="$d" '$1 == "ip_address:" || $1 == "ipv6_address:" { print $2, d }'
+  done | while read -r ip d; do
+    if [[ $ip =~ $IP_RE || $ip =~ $IP6_RE ]]; then echo "$ip $d"; fi
+  done
 }
 
 # --- mitmproxy: route-to dei client LAN e del traffico del Mac verso <mitm_local> ---
@@ -102,24 +110,38 @@ fi
 # Tabella <mitm_local>: IP risolti negli ultimi $KEEP secondi. Le CDN ruotano
 # gli IP a ogni scadenza del TTL (CloudFront: 60s): il browser può usare un IP
 # ottenuto prima dell'ultima risoluzione. Aggiornata solo se gli IP cambiano.
-# Gli IP rimossi non chiudono gli stati: le connessioni aperte restano intercettate.
+# Gli IP scaduti non chiudono gli stati: le connessioni aperte restano
+# intercettate. Gli IP di un dominio tolto dall'elenco escono subito dalla
+# tabella, e i loro stati vengono chiusi.
 TABLE_FILE="$ANCHORS/com.mitm.local"
-SEEN_FILE="$ANCHORS/com.mitm.local.seen"   # "<epoch> <IP>"
+SEEN_FILE="$ANCHORS/com.mitm.local.seen"   # "<epoch> <IP> <dominio>"
 KEEP=900
 if [ -n "$RULE" ]; then
   NOW=$(date +%s)
+  DOMAINS=$(domain_list)
+  RECENT=""
+  [ -f "$SEEN_FILE" ] && RECENT=$(awk -v min=$((NOW - KEEP)) '$1 >= min' "$SEEN_FILE")
   {
-    [ -f "$SEEN_FILE" ] && awk -v min=$((NOW - KEEP)) '$1 >= min' "$SEEN_FILE"
-    resolve_domains | sed "s/^/$NOW /"
-  } | sort -k2,2 -k1,1nr | awk '!seen[$2]++' > "$SEEN_FILE.tmp"
+    # Righe di domini ancora in elenco (le righe senza dominio, del formato
+    # precedente, vengono scartate)
+    # (l'elenco come file: l'awk di macOS non accetta a capo in -v)
+    awk 'FILENAME == ARGV[1] { ok[$1] = 1; next } NF == 3 && ($3 in ok)' \
+      <(printf '%s\n' "$DOMAINS") <(printf '%s\n' "$RECENT")
+    resolve_domains "$DOMAINS" | sed "s/^/$NOW /"
+  } | sort -k2,2 -k3,3 -k1,1nr | awk '!seen[$2 " " $3]++' > "$SEEN_FILE.tmp"
   mv "$SEEN_FILE.tmp" "$SEEN_FILE"
-  IPS=$(awk '{ print $2 }' "$SEEN_FILE")
+  IPS=$(awk '!seen[$2]++ { print $2 }' "$SEEN_FILE")
   if [ "$FORCE_TABLE" = true ] || [ ! -f "$TABLE_FILE" ] || [ "$(cat "$TABLE_FILE")" != "$IPS" ]; then
     printf '%s' "$IPS" > "$TABLE_FILE"
     [ -n "$IPS" ] && printf '\n' >> "$TABLE_FILE"
     pfctl -q -a com.mitm.route -t mitm_local -T replace -f "$TABLE_FILE"
     echo "$(date '+%F %T') mitm_local: $(grep -c . "$TABLE_FILE") IP"
   fi
+  # IP non scaduti ma tolti con il loro dominio: chiude le connessioni aperte
+  for ip in $(comm -23 <(awk 'NF == 3 { print $2 }' <<<"$RECENT" | sort -u) <(sort -u <<<"$IPS")); do
+    if [[ $ip == *:* ]]; then any=::/0; else any=0.0.0.0/0; fi
+    pfctl -q -k "$any" -k "$ip"
+  done
 else
   rm -f "$TABLE_FILE" "$SEEN_FILE"
 fi
