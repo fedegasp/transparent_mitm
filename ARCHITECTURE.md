@@ -131,6 +131,7 @@ A single command, [mitm](mitm), for start, stop and diagnostics:
 ./mitm start [dhcp]            start DHCP and mitmproxy (with dhcp: DHCP only)
 ./mitm stop [dhcp|all] [--rm]  stop mitmproxy (dhcp: DHCP only; all: both)
 ./mitm status                  status of containers, pf rules, daemon and agents
+./mitm open                    mitmproxy interface (web UI in the browser, or console)
 ./mitm attach                  mitmproxy console (tmux)
 ./mitm logs [dhcp|pf] [-f]     logs of mitmproxy, dnsmasq or the pf daemon
 ./mitm build [proxy|dhcp]      build the images (default: both)
@@ -213,11 +214,11 @@ This tests `dnsmasq` and its upstream, not the `rdr` of `192.168.3.2:53`: that m
 
 ### 7. mitmproxy container: interface, web UI and volumes
 
-Usage (start, `./mitm attach`, changing interface): [README.md](README.md#usage). The containers are on the `default` network (no `--network`).
+Usage (start, `./mitm open`, changing interface): [README.md](README.md#usage). The containers are on the `default` network (no `--network`).
 
-Interface chosen with `MITM_UI`, read only when the container is created (to change it the container must be recreated, because `start` does not touch an existing container):
-- `console` (default): `mitmproxy` in `tmux` (section 5). `./mitm attach` is `container exec -it mitmproxy.test tmux attach -t mitm`: no ssh, which is not needed and would expose one more port, to the LAN too.
-- `web`: `mitmweb` on `:8081`, password from `MITM_WEB_PASSWORD` (default `password`).
+Interface chosen with `MITM_UI`, read only when the container is created (to change it the container must be recreated, because `start` does not touch an existing container). `./mitm open` opens whichever one the container was created with (read from `container inspect`):
+- `console` (default): `mitmproxy` in `tmux` (section 5). `./mitm open` and `./mitm attach` are `container exec -it mitmproxy.test tmux attach -t mitm`: no ssh, which is not needed and would expose one more port, to the LAN too.
+- `web`: `mitmweb` on `:8081`, password from `MITM_WEB_PASSWORD` (default `password`). `./mitm open` opens `http://mitmproxy.test:8081/` in the default browser, without the password in the URL (`?token=`): it would end up in the browser history.
 
 After a Mac reboot the `container` services do not restart on their own (`apiserver is not running and not registered with launchd`): the `com.mitm.dhcp` LaunchAgent (section 9) starts them at login, together with DHCP. mitmproxy is restarted by hand with `./mitm start`.
 

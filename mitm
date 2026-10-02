@@ -19,6 +19,8 @@ Usage: ./mitm <command>
                           --rm also removes the containers (after build, or to
                           change MITM_UI / MITM_WEB_PASSWORD)
   status                  status of containers, pf rules, daemon and agents
+  open                    open the mitmproxy interface: web UI in the browser,
+                          or the console as with attach
   attach                  mitmproxy console (tmux; Ctrl-b d to detach)
   logs [dhcp|pf] [-f]     logs of mitmproxy, dnsmasq or the pf daemon
   build [proxy|dhcp]      build the images (default: both)
@@ -27,8 +29,8 @@ Usage: ./mitm <command>
   uninstall               remove agents, daemon and pf rules
 
 mitmproxy interface, read only when the container is created:
-  MITM_UI=console (default)          mitmproxy in tmux: ./mitm attach
-  MITM_UI=web MITM_WEB_PASSWORD=...  mitmweb on http://mitmproxy.test:8081
+  MITM_UI=console (default)          mitmproxy in tmux: ./mitm open (or attach)
+  MITM_UI=web MITM_WEB_PASSWORD=...  mitmweb on http://mitmproxy.test:8081: ./mitm open
 EOF
 }
 
@@ -301,9 +303,9 @@ start_proxy() {
   echo "mitmproxy pf rule applied"
 
   if [ "$(proxy_ui)" = web ]; then
-    echo "Web UI: http://$PROXY:8081"
+    echo "Web UI: http://$PROXY:8081   (./mitm open)"
   else
-    echo "Console: ./mitm attach   (Ctrl-b d to detach)"
+    echo "Console: ./mitm open   (Ctrl-b d to detach)"
   fi
 }
 
@@ -506,6 +508,18 @@ cmd_attach() {
   fi
 }
 
+# Opens the mitmproxy interface: the web UI in the default browser, or the
+# console in this terminal. The password is not put in the URL (it would end
+# up in the browser history): mitmweb asks for it on the login page.
+cmd_open() {
+  [ "$(container_state "$PROXY")" = running ] || die "mitmproxy is not running: ./mitm start"
+  if [ "$(proxy_ui)" = web ]; then
+    /usr/bin/open "http://$PROXY:8081/"
+  else
+    exec container exec -it "$PROXY" tmux attach -t mitm
+  fi
+}
+
 cmd_logs() {
   local target=proxy follow=() arg
   for arg in "$@"; do
@@ -550,6 +564,7 @@ case "${1:-}" in
   stop) shift; cmd_stop "$@" ;;
   status) cmd_status ;;
   attach) cmd_attach ;;
+  open) cmd_open ;;
   logs) shift; cmd_logs "$@" ;;
   build) shift; cmd_build "$@" ;;
   install) cmd_install ;;

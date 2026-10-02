@@ -39,6 +39,7 @@ Other files:
 ./mitm start [dhcp]            start DHCP and mitmproxy (with dhcp: DHCP only)
 ./mitm stop [dhcp|all] [--rm]  stop mitmproxy (dhcp: DHCP only; all: both)
 ./mitm status                  status of containers, pf rules, daemon and agents
+./mitm open                    mitmproxy interface (web UI in the browser, or console)
 ./mitm attach                  mitmproxy console
 ./mitm logs [dhcp|pf] [-f]     logs of mitmproxy, dnsmasq or the pf daemon
 ./mitm build [proxy|dhcp]      rebuild the images
@@ -48,9 +49,9 @@ No command needs sudo, except `install`/`uninstall`. DHCP starts by itself at lo
 
 ### mitmproxy interface
 
-Chosen when the container is created, with `MITM_UI`:
-- `console` (default): `./mitm attach` opens mitmproxy in the container's `tmux` session. `Ctrl-b d` detaches the terminal leaving mitmproxy running; `q` restarts it (flows are lost), without stopping the container.
-- `web`: `http://mitmproxy.test:8081`, password `password` or the one chosen.
+Chosen when the container is created, with `MITM_UI`. `./mitm open` opens it, whichever it is:
+- `console` (default): mitmproxy in the container's `tmux` session, in the terminal (also `./mitm attach`). `Ctrl-b d` detaches the terminal leaving mitmproxy running; `q` restarts it (flows are lost), without stopping the container.
+- `web`: `http://mitmproxy.test:8081` in the default browser, password `password` or the one chosen.
 
 To change the interface or the password the container must be recreated:
 ```bash
