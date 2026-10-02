@@ -1,0 +1,492 @@
+#!/bin/bash
+set -euo pipefail
+
+# Gestione di mitmproxy (container mitmproxy.test) e del DHCP/DNS della LAN
+# (container mitm-dhcp), e delle regole pf che gli inoltrano il traffico.
+#
+# Nessun sudo: le regole pf le applica il LaunchDaemon di root com.mitm.pf,
+# a cui il comando scrive gli IP dei container in /usr/local/var/mitm-pf/.
+# Il DHCP è autonomo (start dhcp / stop dhcp non toccano mitmproxy): con il
+# solo DHCP i client hanno il Mac come gateway e navigano via NAT, senza
+# intercettazione. mitmproxy dipende dal DHCP: start lo avvia per primo.
+
+usage() {
+  cat <<'EOF'
+Uso: ./mitm <comando>
+
+  start [dhcp]            avvia DHCP e mitmproxy (con dhcp: solo il DHCP)
+  stop [dhcp|all] [--rm]  ferma mitmproxy (dhcp: solo il DHCP; all: entrambi)
+                          --rm rimuove anche i container (dopo build, o per
+                          cambiare MITM_UI / MITM_WEB_PASSWORD)
+  status                  stato di container, regole pf, daemon e agent
+  attach                  console di mitmproxy (tmux; Ctrl-b d per staccarsi)
+  logs [dhcp|pf] [-f]     log di mitmproxy, di dnsmasq o del daemon pf
+  build [proxy|dhcp]      costruisce le immagini (default: entrambe)
+
+Interfaccia di mitmproxy, letta solo alla creazione del container:
+  MITM_UI=console (default)          mitmproxy in tmux: ./mitm attach
+  MITM_UI=web MITM_WEB_PASSWORD=...  mitmweb su http://mitmproxy.test:8081
+EOF
+}
+
+# I volumi usano percorsi relativi alla directory del progetto (anche se il
+# comando è lanciato tramite un link simbolico)
+cd "$(dirname "$(readlink -f "$0")")"
+
+# Dominio DNS locale di container (creato una volta con
+# `sudo container system dns create test`). Il DNS integrato risolve solo i
+# container il cui nome è <nome>.<dominio>: sul Mac la web UI è raggiungibile
+# come http://mitmproxy.test:8081, qualunque sia l'IP corrente.
+DNS_DOMAIN=test
+PROXY=mitmproxy.$DNS_DOMAIN
+PROXY_IMAGE=mitm-transparent
+DHCP=mitm-dhcp
+DHCP_IMAGE=mitm-dhcp
+STATE=/usr/local/var/mitm-pf
+ANCHORS=/etc/pf.anchors
+DAEMON_CONF=/usr/local/etc/mitm.conf
+PF_LOG=/var/log/mitm-pf.log
+IP_RE='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+
+die() {
+  echo "$*" >&2
+  exit 1
+}
+
+# Valore di KEY=valore in mitm.conf, o nel file $2 (come il daemon: il file
+# non viene eseguito)
+conf() {
+  sed -nE "s/^$1=[\"']?([^\"'#[:space:]]*).*/\1/p" "${2:-mitm.conf}" 2> /dev/null | tail -n 1
+}
+
+# La copia del daemon ha gli stessi valori che il daemon usa (i commenti
+# possono differire)
+daemon_conf_current() {
+  local key
+  for key in LAN_IP ROUTER_IP; do
+    [ "$(conf $key)" = "$(conf $key "$DAEMON_CONF")" ] || return 1
+  done
+}
+
+# Stato del container: running, stopped, ... oppure absent
+container_state() {
+  container inspect "$1" 2> /dev/null | jq -r '.[0].status.state // "absent"' 2> /dev/null ||
+    echo absent
+}
+
+# IP del container. Viene assegnato poco dopo l'avvio: attende fino a ~10s.
+container_ip() {
+  local ip
+  for _ in $(seq 1 20); do
+    ip=$(container inspect "$1" | jq -r '.[0].status.networks[0].ipv4Address // empty' | cut -d'/' -f1)
+    if [ -n "$ip" ]; then
+      echo "$ip"
+      return 0
+    fi
+    sleep 0.5
+  done
+  die "Impossibile determinare l'IP del container $1"
+}
+
+# Costruisce l'immagine $1 dalla directory $2 se non esiste
+ensure_image() {
+  container image inspect "$1" > /dev/null 2>&1 && return 0
+  echo "Immagine $1 assente, la costruisco"
+  container build -t "$1" "$2"
+}
+
+# Avvia il container $1 se è fermo; se non esiste ritorna 1 (da creare).
+# Un errore di avvio (es. volume di un percorso che non esiste più) termina
+# il comando: ricrearlo fallirebbe comunque (nome già in uso).
+start_existing() {
+  case "$(container_state "$1")" in
+    absent) return 1 ;;
+    running) ;;
+    *)
+      echo "Avvio il container $1"
+      container start "$1" > /dev/null ||
+        die "Avvio di $1 fallito: se il progetto è stato spostato, ricrearlo con ./mitm stop all --rm"
+      ;;
+  esac
+}
+
+# Ferma il container $1 se è in esecuzione; con $2 = true lo rimuove
+stop_container() {
+  local state
+  state=$(container_state "$1")
+  if [ "$state" = absent ]; then
+    echo "Container $1 non presente"
+    return 0
+  fi
+  if [ "$state" = running ]; then
+    echo "Fermo il container $1"
+    container stop "$1" > /dev/null
+  fi
+  if [ "$2" = true ]; then
+    echo "Rimuovo il container $1"
+    container rm "$1" > /dev/null
+  fi
+}
+
+# Scrive il file di stato per il daemon (rename atomico: il daemon, attivato
+# da WatchPaths sulla directory, non legge mai un file scritto a metà)
+write_state() {
+  [ -d "$STATE" ] || die "$STATE assente: installare il daemon con sudo ./daemon/install.sh"
+  printf '%s\n' "$2" > "$STATE/.$1.tmp"
+  mv "$STATE/.$1.tmp" "$STATE/$1"
+}
+
+# Attende che il daemon abbia applicato la regola: anchor che contiene $2,
+# o vuoto se $2 è vuoto. Fino a ~10s.
+wait_anchor() {
+  for _ in $(seq 1 20); do
+    if [ -z "$2" ]; then
+      [ ! -s "$1" ] && return 0
+    else
+      grep -qF -- "$2" "$1" 2> /dev/null && return 0
+    fi
+    sleep 0.5
+  done
+  die "Il daemon com.mitm.pf non ha aggiornato $1: vedi $PF_LOG"
+}
+
+# Interfaccia di mitmproxy con cui è stato creato il container
+proxy_ui() {
+  if container inspect "$PROXY" 2> /dev/null |
+    jq -e '.[0].configuration.initProcess.environment | index("MITM_UI=web")' > /dev/null; then
+    echo web
+  else
+    echo console
+  fi
+}
+
+# --- DHCP e DNS (dnsmasq) ---------------------------------------------------
+
+# Avvia dnsmasq e le regole pf che gli inoltrano il relay DHCP del router e
+# le query DNS dei client verso il Mac. I parametri della LAN vengono da
+# mitm.conf: genera dhcp/lan.conf e riavvia il container se è cambiato.
+start_dhcp() {
+  local lan_ip mac_ip prefix router first last lease v mask netmask lan_conf changed=false ip
+
+  lan_ip=$(conf LAN_IP)
+  mac_ip=${lan_ip%/*}
+  prefix=${lan_ip#*/}
+  router=$(conf ROUTER_IP)
+  first=$(conf DHCP_FIRST)
+  last=$(conf DHCP_LAST)
+  lease=$(conf DHCP_LEASE)
+  for v in mac_ip router first last; do
+    [[ ${!v} =~ $IP_RE ]] || die "mitm.conf: valore non valido per $v: '${!v}'"
+  done
+  [[ $prefix =~ ^[0-9]+$ ]] && [ "$prefix" -ge 8 ] && [ "$prefix" -le 30 ] ||
+    die "mitm.conf: LAN_IP deve avere un prefisso (es. 192.168.3.2/24)"
+  [[ $lease =~ ^[0-9]+[mhd]?$ ]] || die "mitm.conf: DHCP_LEASE non valido: '$lease'"
+
+  # Il daemon usa la propria copia di mitm.conf
+  daemon_conf_current ||
+    echo "Attenzione: mitm.conf diverso dalla copia del daemon, rilanciare: sudo ./daemon/install.sh" >&2
+
+  # Parametri della LAN per dnsmasq (incluso da dhcp/dnsmasq.conf)
+  mask=$(((0xffffffff << (32 - prefix)) & 0xffffffff))
+  netmask="$((mask >> 24 & 255)).$((mask >> 16 & 255)).$((mask >> 8 & 255)).$((mask & 255))"
+  lan_conf="# Generato da ./mitm start dhcp da mitm.conf: non modificare
+dhcp-range=$first,$last,$netmask,$lease
+dhcp-option=option:router,$mac_ip
+dhcp-option=option:dns-server,$mac_ip
+dhcp-proxy=$router"
+  if [ "$(cat dhcp/lan.conf 2> /dev/null)" != "$lan_conf" ]; then
+    printf '%s\n' "$lan_conf" > dhcp/lan.conf
+    changed=true
+  fi
+
+  # Crea il container se non esiste, lo avvia se è fermo. Configurazione e
+  # lease in ./dhcp. NET_ADMIN è richiesta da dnsmasq per il DHCP
+  # (altrimenti esce all'avvio).
+  if start_existing "$DHCP"; then
+    # dnsmasq legge la configurazione solo all'avvio
+    if [ "$changed" = true ]; then
+      echo "Configurazione LAN cambiata, riavvio il container $DHCP"
+      container stop "$DHCP" > /dev/null
+      container start "$DHCP" > /dev/null
+    fi
+  else
+    ensure_image "$DHCP_IMAGE" dhcp/
+    echo "Creo il container $DHCP"
+    container run -d --name "$DHCP" \
+      --cap-add NET_ADMIN \
+      --volume ./dhcp:/data \
+      "$DHCP_IMAGE" > /dev/null
+  fi
+
+  ip=$(container_ip "$DHCP")
+  echo "IP DHCP: $ip"
+
+  # Relay DHCP del router e query DNS dei client → dnsmasq (regole rdr
+  # generate dal daemon, scritte insieme: basta attendere quella del DNS)
+  write_state dhcp "$ip"
+
+  # Senza l'interfaccia LAN (cavo scollegato, IP non ancora assegnato) il
+  # daemon non genera le regole: le aggiunge entro 60s da quando l'IP compare
+  if ! ifconfig | grep -qE "^[[:space:]]inet $mac_ip "; then
+    echo "Nessuna interfaccia con IP $mac_ip: regole DHCP/DNS applicate quando la LAN sarà collegata"
+    return 0
+  fi
+  wait_anchor "$ANCHORS/mitm.dhcp" "-> $ip port 53"
+  echo "Regole pf DHCP/DNS applicate"
+}
+
+# Ferma dnsmasq e rimuove le regole pf (relay e DNS). Senza DHCP i client non
+# ottengono né rinnovano il lease e il DNS del Mac non risponde: se il Mac
+# smette di fare da gateway, rimettere il router in modalità DHCP server.
+stop_dhcp() {
+  stop_container "$DHCP" "$1"
+  write_state dhcp ""
+  wait_anchor "$ANCHORS/mitm.dhcp" ""
+  echo "DHCP e DNS fermi: i client non rinnovano il lease e non risolvono nomi (ripristinare il DHCP server sul router se serve)"
+}
+
+# --- mitmproxy --------------------------------------------------------------
+
+# Avvia mitmproxy e le regole pf che gli instradano l'HTTP/HTTPS dei client
+# LAN e del Mac verso i domini di domini-mac.txt. Avvia prima il DHCP, che
+# assegna il Mac come gateway ai client.
+start_proxy() {
+  local ip
+
+  start_dhcp
+
+  if ! start_existing "$PROXY"; then
+    ensure_image "$PROXY_IMAGE" .
+    echo "Creo il container $PROXY"
+    # ./export: directory corrente di mitmproxy, i file salvati dai suoi
+    # comandi compaiono qui sul Mac (deve esistere, altrimenti container run
+    # fallisce)
+    mkdir -p export
+    container run -d --name "$PROXY" \
+      --cap-add NET_ADMIN \
+      --dns-domain "$DNS_DOMAIN" \
+      --volume ./mitmproxy:/root/.mitmproxy \
+      --volume ./export:/export \
+      -e "MITM_UI=${MITM_UI:-console}" \
+      -e "MITM_WEB_PASSWORD=${MITM_WEB_PASSWORD:-password}" \
+      "$PROXY_IMAGE" > /dev/null
+  fi
+
+  ip=$(container_ip "$PROXY")
+  echo "IP mitmproxy: $ip"
+
+  # Domini del traffico del Mac da intercettare: il daemon li risolve e li
+  # carica nella tabella pf <mitm_local>
+  write_state domains "$(cat domini-mac.txt 2> /dev/null)"
+
+  # HTTP/HTTPS dei client LAN, e del Mac verso <mitm_local> → mitmproxy
+  # (instradato, destinazione invariata; regole route-to generate dal daemon,
+  # che ricava anche il bridge verso il container). La regola del tag c'è
+  # sempre, anche senza LAN né rete: basta attendere quella.
+  write_state route "$ip"
+  wait_anchor "$ANCHORS/mitm.route" "from $ip to any port"
+  echo "Regola pf mitmproxy applicata"
+
+  if [ "$(proxy_ui)" = web ]; then
+    echo "Web UI: http://$PROXY:8081"
+  else
+    echo "Console: ./mitm attach   (Ctrl-b d per staccarsi)"
+  fi
+}
+
+# Ferma mitmproxy e rimuove le regole route-to. Il DHCP resta attivo: i
+# client mantengono il Mac come gateway e navigano via NAT. Senza svuotare la
+# regola, l'HTTP/HTTPS dei client resterebbe instradato verso un IP non più
+# attivo.
+stop_proxy() {
+  stop_container "$PROXY" "$1"
+  write_state route ""
+  wait_anchor "$ANCHORS/mitm.route" ""
+  echo "Intercettazione disattivata: i client LAN escono su Internet via NAT del Mac"
+}
+
+# --- status -----------------------------------------------------------------
+
+# "state" e "last exit code" di un job launchd ($1: system/... o gui/...)
+launchd_job() {
+  local out
+  if ! out=$(launchctl print "$1" 2> /dev/null); then
+    echo "non installato"
+    return 0
+  fi
+  # I job partono a eventi (WatchPaths, login): "not running" è la norma
+  awk -F' = ' '
+    /^\tstate = / { state = $2 }
+    /^\tlast exit code = / { code = $2 }
+    END {
+      printf "installato, %s", (state == "running" ? "in esecuzione" : "in attesa")
+      if (code == "(never exited)" || code == "") print ", mai eseguito"
+      else if (code == "0") print ", ultima esecuzione ok"
+      else print ", ULTIMA ESECUZIONE FALLITA (" code ")"
+    }' <<<"$out"
+}
+
+# Riga di stato di una regola: "→ IP" o "spento"
+rule_target() {
+  if [ -n "$1" ]; then echo "→ $1"; else echo spento; fi
+}
+
+# Primo campo del file di stato $1 (vuoto se assente)
+state_ip() {
+  awk 'NR == 1 { print $NF }' "$STATE/$1" 2> /dev/null || true
+}
+
+cmd_status() {
+  local name state ip want sub warn=() rules n
+
+  echo "Configurazione (mitm.conf): LAN_IP=$(conf LAN_IP) ROUTER_IP=$(conf ROUTER_IP)"
+  if [ ! -f "$DAEMON_CONF" ]; then
+    warn+=("copia del daemon assente: sudo ./daemon/install.sh")
+  elif ! daemon_conf_current; then
+    warn+=("mitm.conf diverso dalla copia del daemon: sudo ./daemon/install.sh")
+  fi
+  echo "Rete rilevata dal daemon: $(cat "$ANCHORS/mitm.net" 2> /dev/null || echo -)"
+  echo "IP forwarding: $([ "$(sysctl -n net.inet.ip.forwarding)" = 1 ] && echo attivo || echo SPENTO)"
+  [ "$(sysctl -n net.inet.ip.forwarding)" = 1 ] ||
+    warn+=("IP forwarding spento: i client LAN non escono (sudo sysctl -w net.inet.ip.forwarding=1)")
+
+  echo
+  if ! container system status > /dev/null 2>&1; then
+    echo "Servizi di container: non attivi (container system start)"
+    warn+=("servizi di container non attivi")
+  else
+    echo "Container:"
+    for name in "$DHCP" "$PROXY"; do
+      state=$(container_state "$name")
+      ip=""
+      [ "$state" = running ] &&
+        ip=$(container inspect "$name" | jq -r '.[0].status.networks[0].ipv4Address // empty' | cut -d/ -f1)
+      if [ "$name" = "$PROXY" ] && [ "$state" != absent ]; then
+        printf '  %-16s %-9s %-15s %s\n' "$name" "$state" "$ip" "($(proxy_ui))"
+      else
+        printf '  %-16s %-9s %s\n' "$name" "$state" "$ip"
+      fi
+      # Regola pf coerente con il container
+      if [ "$name" = "$DHCP" ]; then
+        want=$(state_ip dhcp) sub=" dhcp"
+      else
+        want=$(state_ip route) sub=""
+      fi
+      if [ -n "$want" ] && [ "$want" != "$ip" ]; then
+        warn+=("regola pf di $name verso $want, ma il container ${ip:+ha IP $ip}${ip:-non è attivo}: ./mitm start$sub oppure ./mitm stop$sub")
+      elif [ -z "$want" ] && [ -n "$ip" ]; then
+        warn+=("$name attivo senza regola pf: ./mitm start$sub")
+      fi
+    done
+  fi
+
+  echo
+  echo "Regole pf (com.apple/100.mitm.*):"
+  n=$(grep -c . "$ANCHORS/mitm.nat" 2> /dev/null || true)
+  printf '  %-11s %s\n' NAT "$([ "${n:-0}" -gt 0 ] && echo "$n regole" || echo assente)"
+  rules=$(sed -nE 's/.*port 53 -> ([0-9.]+) port 53/\1/p' "$ANCHORS/mitm.dhcp" 2> /dev/null || true)
+  printf '  %-11s %s\n' DHCP/DNS "$(rule_target "$rules")"
+  rules=$(sed -nE 's/.*from ([0-9.]+) to any port.*tag MITM_VM.*/\1/p' "$ANCHORS/mitm.route" 2> /dev/null || true)
+  printf '  %-11s %s\n' mitmproxy "$(rule_target "$rules")"
+  if [ -n "$rules" ]; then
+    n=$(grep -c . "$ANCHORS/mitm.local" 2> /dev/null || true)
+    printf '  %-11s %s IP in <mitm_local>, %s domini in domini-mac.txt\n' "domini Mac" "${n:-0}" \
+      "$(sed -E 's/#.*//; s/[[:space:]]+//g' domini-mac.txt 2> /dev/null | grep -c . || true)"
+  fi
+
+  echo
+  state=$(launchd_job system/com.mitm.pf)
+  echo "Daemon com.mitm.pf: $state"
+  case "$state" in
+    *FALLITA* | "non installato") warn+=("daemon com.mitm.pf: vedi $PF_LOG, reinstallare con sudo ./daemon/install.sh") ;;
+  esac
+  for name in dhcp domains; do
+    state=$(launchd_job "gui/$(id -u)/com.mitm.$name")
+    echo "LaunchAgent com.mitm.$name: $state"
+    case "$state" in
+      *FALLITA*) warn+=("LaunchAgent com.mitm.$name: vedi ~/Library/Logs/mitm-$name.log") ;;
+    esac
+  done
+
+  if [ ${#warn[@]} -gt 0 ]; then
+    echo
+    printf 'Attenzione: %s\n' "${warn[@]}"
+  fi
+}
+
+# --- comandi ----------------------------------------------------------------
+
+cmd_stop() {
+  local target=proxy rm=false arg
+  for arg in "$@"; do
+    case "$arg" in
+      --rm) rm=true ;;
+      proxy | dhcp | all) target=$arg ;;
+      *) usage >&2; exit 1 ;;
+    esac
+  done
+  case "$target" in
+    proxy) stop_proxy "$rm" ;;
+    dhcp) stop_dhcp "$rm" ;;
+    all) stop_proxy "$rm"; stop_dhcp "$rm" ;;
+  esac
+}
+
+cmd_attach() {
+  [ "$(container_state "$PROXY")" = running ] || die "mitmproxy non è attivo: ./mitm start"
+  if [ "$(proxy_ui)" = web ]; then
+    echo "Web UI: http://$PROXY:8081"
+  else
+    exec container exec -it "$PROXY" tmux attach -t mitm
+  fi
+}
+
+cmd_logs() {
+  local target=proxy follow=() arg
+  for arg in "$@"; do
+    case "$arg" in
+      -f) follow=(-f) ;;
+      proxy | dhcp | pf) target=$arg ;;
+      *) usage >&2; exit 1 ;;
+    esac
+  done
+  case "$target" in
+    pf) exec tail -n 50 ${follow[@]+"${follow[@]}"} "$PF_LOG" ;;
+    dhcp) exec container logs ${follow[@]+"${follow[@]}"} "$DHCP" ;;
+    proxy)
+      # In console l'output di mitmproxy è nella sessione tmux, non nei log
+      [ "$(proxy_ui)" = console ] && echo "(console: eventi di mitmproxy in ./mitm attach, tasto E)" >&2
+      exec container logs ${follow[@]+"${follow[@]}"} "$PROXY"
+      ;;
+  esac
+}
+
+cmd_build() {
+  case "${1:-all}" in
+    proxy) container build -t "$PROXY_IMAGE" . ;;
+    dhcp) container build -t "$DHCP_IMAGE" dhcp/ ;;
+    all)
+      container build -t "$PROXY_IMAGE" .
+      container build -t "$DHCP_IMAGE" dhcp/
+      ;;
+    *) usage >&2; exit 1 ;;
+  esac
+  echo "Per usare la nuova immagine: ./mitm stop all --rm && ./mitm start"
+}
+
+case "${1:-}" in
+  start)
+    case "${2:-proxy}" in
+      proxy) start_proxy ;;
+      dhcp) start_dhcp ;;
+      *) usage >&2; exit 1 ;;
+    esac
+    ;;
+  stop) shift; cmd_stop "$@" ;;
+  status) cmd_status ;;
+  attach) cmd_attach ;;
+  logs) shift; cmd_logs "$@" ;;
+  build) shift; cmd_build "$@" ;;
+  -h | --help | help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac

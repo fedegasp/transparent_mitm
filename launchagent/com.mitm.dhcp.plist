@@ -3,7 +3,7 @@
 <!--
   Avvio del DHCP al login (LaunchAgent utente, nessun privilegio).
   Dopo un reboot i servizi di container non sono registrati: prima
-  container system start (idempotente), poi start-dhcp.sh.
+  container system start (idempotente), poi ./mitm start dhcp.
   Installazione: ./launchagent/install.sh, che sostituisce __PROJECT_DIR__
   e __HOME__ (launchd non espande ~ né $HOME).
 -->
@@ -16,8 +16,8 @@
         <string>/bin/bash</string>
         <string>-c</string>
         <!-- Percorso dello script come $0: non viene interpretato dalla shell -->
-        <string>container system start &amp;&amp; exec "$0"</string>
-        <string>__PROJECT_DIR__/start-dhcp.sh</string>
+        <string>container system start &amp;&amp; exec "$0" start dhcp</string>
+        <string>__PROJECT_DIR__/mitm</string>
     </array>
     <!-- container è in /usr/local/bin, assente dal PATH di default di launchd -->
     <key>EnvironmentVariables</key>

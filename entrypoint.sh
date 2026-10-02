@@ -51,7 +51,7 @@ if [ "${MITM_UI:-console}" = console ]; then
 fi
 
 # MITM_UI=web: mitmweb, web UI su :8081.
-# Password della web UI da variabile d'ambiente (start-mitm.sh la passa sempre,
+# Password della web UI da variabile d'ambiente (./mitm start la passa sempre,
 # default 'password'); se assente mitmweb genera un token casuale, visibile in
 # `container logs mitmproxy.test`
 while true; do

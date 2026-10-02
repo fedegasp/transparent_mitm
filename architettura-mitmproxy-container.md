@@ -41,12 +41,12 @@ Tutto il resto viene ricavato a runtime, e segue i cambi di rete:
 - **interfaccia LAN** (`en7` qui): quella che ha `LAN_IP`. Se manca (cavo scollegato) il daemon omette le regole LAN e le aggiunge entro 60s da quando compare;
 - **bridge e subnet dei container**: dalla rotta verso l'IP del container (daemon) e dall'interfaccia di default dentro il container (`entrypoint.sh`).
 
-`mitm.conf` è letto da `start-dhcp.sh` (genera `dhcp/lan.conf` per `dnsmasq`) e dal daemon di root, che ne usa una copia in `/usr/local/etc/mitm.conf` (installata da `sudo ./daemon/install.sh`: il daemon non legge configurazione modificabile dall'utente). Il file non viene mai eseguito, solo letto riga per riga (`KEY=valore`). Dopo una modifica:
+`mitm.conf` è letto da `./mitm start dhcp` (genera `dhcp/lan.conf` per `dnsmasq`) e dal daemon di root, che ne usa una copia in `/usr/local/etc/mitm.conf` (installata da `sudo ./daemon/install.sh`: il daemon non legge configurazione modificabile dall'utente). Il file non viene mai eseguito, solo letto riga per riga (`KEY=valore`). Dopo una modifica:
 ```bash
 sudo ./daemon/install.sh
-./stop-dhcp.sh && ./start-dhcp.sh
+./mitm stop dhcp && ./mitm start dhcp
 ```
-`start-dhcp.sh` avvisa se il file del progetto e la copia del daemon sono diversi.
+`./mitm start dhcp` e `./mitm status` avvisano se i valori del file del progetto e della copia del daemon sono diversi.
 
 ## Flusso del traffico
 
@@ -120,7 +120,7 @@ Gli anchor sono generati e caricati dal daemon `com.mitm.pf` (punto 9); i modell
 - `com.apple/100.mitm.route`: `route-to (bridge100 <IP_CONTAINER>)` del TCP 80/443 in ingresso su `en7` dalla LAN. L'interfaccia nel `route-to` è quella **bridge di vmnet** (`bridge100`), non `en7`. Contiene anche le regole per il traffico del Mac verso la tabella `<mitm_local>` (punto 10).
 - `com.apple/100.mitm.dhcp`: `rdr` verso `<IP_DHCP>` del relay DHCP (UDP 67 da `192.168.3.1` a `192.168.3.2`) e delle query DNS (UDP/TCP 53 dalla LAN a `192.168.3.2`). Il DNS è ristretto alle query **verso il Mac**: un client con DNS configurato a mano (es. `8.8.8.8`) esce via NAT come prima.
 
-DHCP (e DNS, servito dallo stesso container) e mitmproxy hanno ciascuno il proprio anchor e i propri script (punti 3 e 8): `stop-mitm.sh` rimuove l'intercettazione senza interrompere il DHCP.
+DHCP (e DNS, servito dallo stesso container) e mitmproxy hanno ciascuno il proprio anchor e il proprio ciclo di vita (punti 3 e 8): `./mitm stop` rimuove l'intercettazione senza interrompere il DHCP.
 
 **pf su macOS non è abilitato di default**: `pfctl -f` carica le regole ma non le attiva. Il daemon lo abilita (`pfctl -E`) se serve.
 
@@ -128,26 +128,34 @@ Il daemon ricarica **solo il singolo anchor** (`pfctl -a <anchor> -f ...`), mai 
 
 Versione precedente: anchor `com.mitm.*` dichiarati in una copia modificata di `/etc/pf.conf`. `daemon/install.sh` toglie quelle righe (copia in `/etc/pf.conf.mitm-bak`) e svuota i vecchi anchor senza reload completo; i riferimenti vuoti rimasti nel ruleset principale spariscono al reboot.
 
-### 3. Script di avvio (`start-dhcp.sh`, `start-mitm.sh`)
+### 3. Comando `mitm`
 
-L'IP dei container cambia a ogni riavvio (non esiste un flag per fissarlo — `container run --network` supporta solo `mac`/`mtu`, non `ip`): gli script leggono l'IP corrente e rigenerano l'anchor pf corrispondente.
+Un solo comando, [mitm](mitm), per avvio, arresto e diagnosi:
+```
+./mitm start [dhcp]            avvia DHCP e mitmproxy (con dhcp: solo il DHCP)
+./mitm stop [dhcp|all] [--rm]  ferma mitmproxy (dhcp: solo il DHCP; all: entrambi)
+./mitm status                  stato di container, regole pf, daemon e agent
+./mitm attach                  console di mitmproxy (tmux)
+./mitm logs [dhcp|pf] [-f]     log di mitmproxy, di dnsmasq o del daemon pf
+./mitm build [proxy|dhcp]      costruisce le immagini (default: entrambe)
+```
 
-DHCP e mitmproxy hanno **script separati**, con una dipendenza a senso unico:
-- `start-dhcp.sh` è **autonomo**: gestisce solo `mitm-dhcp` e l'anchor `com.apple/100.mitm.dhcp`, non sa nulla di mitmproxy. Con il solo DHCP attivo i client hanno il Mac come gateway e navigano via NAT, senza intercettazione.
-- `start-mitm.sh` **dipende dal DHCP**: come primo passo lancia `./start-dhcp.sh`, poi gestisce `mitmproxy.test` e l'anchor `com.apple/100.mitm.route`.
+L'IP dei container cambia a ogni riavvio (non esiste un flag per fissarlo — `container run --network` supporta solo `mac`/`mtu`, non `ip`): `start` legge l'IP corrente e fa rigenerare l'anchor pf corrispondente.
 
-Entrambi sono **idempotenti** e si possono rilanciare in qualsiasi momento:
-- container **inesistente** → lo crea con `container run` (per mitmproxy è l'unico momento in cui vengono lette `MITM_UI`, default `console`, e `MITM_WEB_PASSWORD`, default `password`);
-- container **fermo** → `container start`;
+DHCP e mitmproxy hanno **cicli di vita separati**, con una dipendenza a senso unico:
+- `start dhcp` è **autonomo**: gestisce solo `mitm-dhcp` e l'anchor `com.apple/100.mitm.dhcp`, non tocca mitmproxy. Con il solo DHCP attivo i client hanno il Mac come gateway e navigano via NAT, senza intercettazione.
+- `start` **dipende dal DHCP**: prima fa `start dhcp`, poi gestisce `mitmproxy.test` e l'anchor `com.apple/100.mitm.route`.
+
+`start` è **idempotente** e si può rilanciare in qualsiasi momento:
+- container **inesistente** → costruisce l'immagine se manca, poi crea il container con `container run` (per mitmproxy è l'unico momento in cui vengono lette `MITM_UI`, default `console`, e `MITM_WEB_PASSWORD`, default `password`);
+- container **fermo** → `container start`. Se l'avvio fallisce (es. progetto spostato, cronologia: volumi) il comando si ferma con l'indicazione di ricrearlo, invece di provare a crearne un altro con lo stesso nome;
 - container **in esecuzione** → nessuna azione sul container.
 
-Poi attendono che l'IP sia assegnato (fino a ~10s), e rigenerano e ricaricano il proprio anchor. `start-dhcp.sh` prima genera `dhcp/lan.conf` da `mitm.conf`, e riavvia `mitm-dhcp` se è cambiato (`dnsmasq` legge la configurazione solo all'avvio). Se nessuna interfaccia ha `LAN_IP` non attende le regole: le genera il daemon quando la LAN viene collegata.
+Poi attende che l'IP sia assegnato (fino a ~10s), e che il daemon abbia applicato la regola. `start dhcp` prima genera `dhcp/lan.conf` da `mitm.conf`, e riavvia `mitm-dhcp` se è cambiato (`dnsmasq` legge la configurazione solo all'avvio). Se nessuna interfaccia ha `LAN_IP` non attende le regole: le genera il daemon quando la LAN viene collegata.
 
-Vanno eseguiti **senza sudo** (`container run/inspect` richiedono la sessione utente) e non chiedono privilegi: invece di scrivere gli anchor, scrivono l'IP corrente in un file di stato in `/usr/local/var/mitm-pf/` (`dhcp` / `route`) e attendono (fino a ~10s) che il LaunchDaemon di root `com.mitm.pf` abbia applicato la regola (punto 9). Si portano nella propria directory (`cd "$(dirname "$0")"`), quindi i volumi relativi (`./mitmproxy`, `./export`, `./dhcp`) funzionano da qualunque directory li si lanci.
+Va eseguito **senza sudo** (`container run/inspect` richiedono la sessione utente) e non chiede privilegi: invece di scrivere gli anchor, scrive l'IP corrente in un file di stato in `/usr/local/var/mitm-pf/` (`dhcp` / `route`) e attende (fino a ~10s) che il LaunchDaemon di root `com.mitm.pf` abbia applicato la regola (punto 9). Si porta nella directory del progetto (anche tramite un link simbolico, es. `ln -s "$PWD/mitm" /usr/local/bin/mitm`), quindi i volumi relativi (`./mitmproxy`, `./export`, `./dhcp`) funzionano da qualunque directory lo si lanci.
 
-Le funzioni comuni (`start_existing`, `container_net`, `write_state`, `wait_anchor`) sono **duplicate** nei due script invece che in un file condiviso: così `start-dhcp.sh` non dipende da nient'altro del progetto.
-
-File: [start-dhcp.sh](start-dhcp.sh), [start-mitm.sh](start-mitm.sh).
+`status` non richiede privilegi: legge i container, i file di stato e quelli generati dal daemon (`/etc/pf.anchors/mitm.*`, leggibili da tutti), e segnala le incoerenze, ad esempio una regola pf che instrada verso un container fermo (HTTP/HTTPS dei client LAN nel vuoto), la copia di `mitm.conf` del daemon non aggiornata, un LaunchAgent fallito o l'IP forwarding spento.
 
 ### 4. Container — immagine (`Containerfile`)
 
@@ -165,16 +173,16 @@ Le due modalità sono alternative: un solo processo può ascoltare su `7070`, e 
 
 Punti critici:
 - **`iptables -t nat -F PREROUTING` prima di ri-aggiungere le regole**, per evitare duplicati a ogni riavvio.
-- **Match `! -s <rete dei container> -m addrtype ! --dst-type LOCAL`**: il REDIRECT vale per i client LAN (`192.168.3.0/24`) e per il Mac (IP della WAN, che cambia tra casa e ufficio: punto 10), non per la rete dei container né per le connessioni dirette al container. La rete dei container (`192.168.64.0/24`) è ricavata all'avvio dall'interfaccia della rotta di default del container (`ip -4 route`), ed è scritta in `container logs mitmproxy.test`. Prima il match era `-s 192.168.3.0/24`: senza filtro sulla sorgente si era osservato un timeout totale dell'egress del container verso Internet (cronologia, punto 8), probabilmente dovuto in realtà agli anchor NAT rimossi (punto 13). **Da verificare** che il nuovo match non riproduca il problema. Una modifica di `entrypoint.sh` richiede `container build` e la ricreazione del container (`./stop-mitm.sh --rm && ./start-mitm.sh`).
+- **Match `! -s <rete dei container> -m addrtype ! --dst-type LOCAL`**: il REDIRECT vale per i client LAN (`192.168.3.0/24`) e per il Mac (IP della WAN, che cambia tra casa e ufficio: punto 10), non per la rete dei container né per le connessioni dirette al container. La rete dei container (`192.168.64.0/24`) è ricavata all'avvio dall'interfaccia della rotta di default del container (`ip -4 route`), ed è scritta in `container logs mitmproxy.test`. Prima il match era `-s 192.168.3.0/24`: senza filtro sulla sorgente si era osservato un timeout totale dell'egress del container verso Internet (cronologia, punto 8), probabilmente dovuto in realtà agli anchor NAT rimossi (punto 13). **Da verificare** che il nuovo match non riproduca il problema. Una modifica di `entrypoint.sh` richiede `container build` e la ricreazione del container (`./mitm build proxy && ./mitm stop --rm && ./mitm start`).
 - **`tini` come PID 1** (via `ENTRYPOINT`) e **mitmproxy/mitmweb in un ciclo `while`**: è un processo figlio che può essere killato/riavviato senza fermare il container. Senza il ciclo, all'uscita di mitmweb termina l'entrypoint e con esso il container.
 - **Console: due cicli**. Quello dentro la sessione `tmux` riavvia `mitmproxy` dopo un'uscita (`q`) senza chiudere la sessione, quindi chi è collegato vede subito la nuova istanza. Quello esterno, nell'entrypoint, ricrea la sessione se viene chiusa (`tmux kill-session`) e tiene in vita il container: `tmux new-session -d` torna subito, senza il ciclo l'entrypoint terminerebbe. In modalità console `container logs mitmproxy.test` non mostra l'output di mitmproxy (è nella sessione `tmux`, eventi con `E`).
 - **Directory corrente `/export`** (volume `./export`, punto 7): i percorsi relativi dei comandi che scrivono su disco finiscono lì.
 - **`block_global=false`**: `block_global` blocca le connessioni da **client** con IP pubblico (non riguarda la destinazione). I client LAN `192.168.3.x` sono privati, quindi non è strettamente necessario; lo si tiene per non avere sorprese se un client arriva con IP non privato.
-- **Password della web UI** (solo `MITM_UI=web`) **da variabile d'ambiente** (`MITM_WEB_PASSWORD`, passata con `container run -e`), non scritta nell'immagine. `start-mitm.sh` la passa sempre, con default `password` se non impostata. Se la variabile mancasse del tutto (container avviato a mano), mitmweb genera un token casuale stampato nei log (`container logs mitmproxy.test`). La web UI è raggiungibile anche dai client LAN (il Mac inoltra `192.168.3.0/24` → `192.168.64.0/24`): con la password di default chiunque sulla LAN può accedervi.
+- **Password della web UI** (solo `MITM_UI=web`) **da variabile d'ambiente** (`MITM_WEB_PASSWORD`, passata con `container run -e`), non scritta nell'immagine. `./mitm start` la passa sempre, con default `password` se non impostata. Se la variabile mancasse del tutto (container avviato a mano), mitmweb genera un token casuale stampato nei log (`container logs mitmproxy.test`). La web UI è raggiungibile anche dai client LAN (il Mac inoltra `192.168.3.0/24` → `192.168.64.0/24`): con la password di default chiunque sulla LAN può accedervi.
 
 ### 6. Container DHCP e DNS (`dhcp/`)
 
-Container separato `mitm-dhcp` con `dnsmasq`, che fa sia da DHCP sia da DNS (con cache) per la LAN: raggiunto dal relay del router e dalle query DNS dei client verso il Mac tramite gli `rdr` di pf (vedi *Flusso del traffico*). È separato da `mitmproxy.test` perché ha un ciclo di vita diverso, con script propri (`start-dhcp.sh` / `stop-dhcp.sh`) che non dipendono da mitmproxy: `stop-mitm.sh` ferma l'intercettazione ma lascia attivo il DHCP, così i client continuano a ricevere/rinnovare il lease e navigano via NAT del Mac.
+Container separato `mitm-dhcp` con `dnsmasq`, che fa sia da DHCP sia da DNS (con cache) per la LAN: raggiunto dal relay del router e dalle query DNS dei client verso il Mac tramite gli `rdr` di pf (vedi *Flusso del traffico*). È separato da `mitmproxy.test` perché ha un ciclo di vita diverso (`./mitm start dhcp` / `./mitm stop dhcp`), che non dipende da mitmproxy: `./mitm stop` ferma l'intercettazione ma lascia attivo il DHCP, così i client continuano a ricevere/rinnovare il lease e navigano via NAT del Mac.
 
 Alternative scartate:
 - **DHCP/DNS server su macOS** (`dnsmasq`/`kea` da brew): processo in ascolto sul Mac, bloccato dall'Application Firewall come mitmproxy (cronologia, punto 1). Provato anche per il DNS: la porta 53 non riceve nulla.
@@ -183,7 +191,7 @@ Alternative scartate:
 - **`bootpd` di macOS** (`/etc/bootpd.plist`): lo stesso file è usato da Condivisione Internet/vmnet, rischio di interferire con la rete dei container.
 - **Relay puntato direttamente all'IP del container**: l'IP cambia a ogni riavvio, e il router invierebbe le richieste al proprio gateway, non al Mac.
 
-File: [dhcp/Containerfile](dhcp/Containerfile) e [dhcp/dnsmasq.conf](dhcp/dnsmasq.conf), che include `dhcp/lan.conf` (range, gateway, DNS e `dhcp-proxy`), generato da `start-dhcp.sh` da `mitm.conf` e ignorato da git. La configurazione e i lease stanno nel volume `/data` (`./dhcp` sul Mac): una modifica a `dnsmasq.conf` richiede solo `container stop/start mitm-dhcp`, non un rebuild. `dnsmasq` gira con `--user=root`, altrimenti cede i privilegi e non può scrivere il file dei lease nel volume.
+File: [dhcp/Containerfile](dhcp/Containerfile) e [dhcp/dnsmasq.conf](dhcp/dnsmasq.conf), che include `dhcp/lan.conf` (range, gateway, DNS e `dhcp-proxy`), generato da `./mitm start dhcp` da `mitm.conf` e ignorato da git. La configurazione e i lease stanno nel volume `/data` (`./dhcp` sul Mac): una modifica a `dnsmasq.conf` richiede solo `container stop/start mitm-dhcp`, non un rebuild. `dnsmasq` gira con `--user=root`, altrimenti cede i privilegi e non può scrivere il file dei lease nel volume.
 
 Punti critici:
 - **Netmask esplicita nel `dhcp-range`**: per le reti servite via relay `dnsmasq` non può ricavarla dalle interfacce locali.
@@ -199,7 +207,7 @@ Punti critici:
 
 Configurazione del router (Zyxel): DHCP in modalità **Relay**, server `192.168.3.2`. Nessun altro server DHCP deve restare attivo sulla LAN.
 
-Log DHCP: `container logs mitm-dhcp` (per vedere anche le query DNS, aggiungere `log-queries` a `dnsmasq.conf`).
+Log DHCP: `./mitm logs dhcp` (per vedere anche le query DNS, aggiungere `log-queries` a `dnsmasq.conf`).
 
 Verifica del DNS, direttamente dal Mac (UDP; con `+tcp` per il TCP):
 ```bash
@@ -214,38 +222,33 @@ Setup una tantum del dominio DNS locale di `container` (vedi *Web UI dal Mac*):
 sudo container system dns create test
 ```
 
-I container vengono creati/avviati dagli script del punto 3, sulla rete `default` (nessun `--network`):
+I container vengono creati/avviati da `./mitm start` (punto 3), sulla rete `default` (nessun `--network`); le immagini, se mancano, le costruisce `start` stesso:
 ```bash
-container build -t mitm-transparent .
-container build -t mitm-dhcp dhcp/
-./start-mitm.sh          # avvia anche il DHCP
+./mitm start          # avvia anche il DHCP
 ```
-Solo DHCP (i client navigano via NAT, senza intercettazione): `./start-dhcp.sh`.
+Solo DHCP (i client navigano via NAT, senza intercettazione): `./mitm start dhcp`.
 
 Interfaccia (variabile `MITM_UI`, letta solo alla creazione del container):
-- `console` (default): `mitmproxy` in `tmux`. Ci si collega dal Mac con `container exec` (niente ssh: non serve, ed esporrebbe una porta in più anche alla LAN):
-  ```bash
-  container exec -it mitmproxy.test tmux attach -t mitm
-  ```
+- `console` (default): `mitmproxy` in `tmux`. Ci si collega dal Mac con `./mitm attach`, cioè `container exec -it mitmproxy.test tmux attach -t mitm` (niente ssh: non serve, ed esporrebbe una porta in più anche alla LAN).
   `Ctrl-b d` stacca il terminale lasciando mitmproxy in esecuzione; `q` dentro mitmproxy lo riavvia (flussi persi), non ferma il container.
-- `web`: `mitmweb`, `http://mitmproxy.test:8081`. Password della web UI: `password`, oppure `MITM_UI=web MITM_WEB_PASSWORD='<password>' ./start-mitm.sh`.
+- `web`: `mitmweb`, `http://mitmproxy.test:8081`. Password della web UI: `password`, oppure `MITM_UI=web MITM_WEB_PASSWORD='<password>' ./mitm start`.
 
-`start-mitm.sh` stampa alla fine il comando o l'URL giusto per il container esistente.
+`./mitm start` stampa alla fine il comando o l'URL giusto per il container esistente; con `MITM_UI=web`, `./mitm attach` stampa l'URL.
 
-Dopo un riavvio (`container stop`, reboot del Mac) basta rieseguire `./start-mitm.sh`: riavvia i container fermi e aggiorna le regole pf. Dopo un **reboot del Mac** i servizi di `container` non ripartono da soli (`apiserver is not running and not registered with launchd`): prima va lanciato `container system start` (vedi *Limiti noti*).
+Dopo un riavvio (`container stop`, reboot del Mac) basta rieseguire `./mitm start`: riavvia i container fermi e aggiorna le regole pf. Dopo un **reboot del Mac** i servizi di `container` non ripartono da soli (`apiserver is not running and not registered with launchd`): prima va lanciato `container system start` (vedi *Limiti noti*).
 
-Per cambiare interfaccia, password o immagine (dopo un nuovo `container build`) il container va ricreato, perché gli script non toccano un container esistente:
+Per cambiare interfaccia, password o immagine (dopo `./mitm build`) il container va ricreato, perché `start` non tocca un container esistente:
 ```bash
-./stop-mitm.sh --rm
-MITM_UI=web MITM_WEB_PASSWORD='<password>' ./start-mitm.sh
+./mitm stop --rm
+MITM_UI=web MITM_WEB_PASSWORD='<password>' ./mitm start
 ```
-Per il container DHCP: `./stop-dhcp.sh --rm && ./start-dhcp.sh`.
+Per il container DHCP: `./mitm stop dhcp --rm && ./mitm start dhcp`.
 
 #### Web UI dal Mac (`MITM_UI=web`): `http://mitmproxy.test:8081`
 
 `container` include un DNS locale (`container-apiserver`, in ascolto su `127.0.0.1:2053`). `sudo container system dns create test` crea `/etc/resolver/containerization.test`, che dice a macOS di risolvere i nomi `*.test` tramite quel server. Il nome segue da solo l'IP del container: niente da aggiornare dopo un riavvio.
 
-Il DNS integrato risolve **solo i container il cui nome è `<nome>.<dominio>`**: per questo il container di mitmproxy si chiama `mitmproxy.test` (`NAME="mitmproxy.$DNS_DOMAIN"` in `start-mitm.sh`). Un container chiamato `mitm-proxy` non viene risolto, né come `mitm-proxy` né come `mitm-proxy.test`, anche se creato con `--dns-domain test` (vedi [Mcrich23/Container-Compose#81](https://github.com/Mcrich23/Container-Compose/issues/81)).
+Il DNS integrato risolve **solo i container il cui nome è `<nome>.<dominio>`**: per questo il container di mitmproxy si chiama `mitmproxy.test` (`PROXY=mitmproxy.$DNS_DOMAIN` in `mitm`). Un container chiamato `mitm-proxy` non viene risolto, né come `mitm-proxy` né come `mitm-proxy.test`, anche se creato con `--dns-domain test` (vedi [Mcrich23/Container-Compose#81](https://github.com/Mcrich23/Container-Compose/issues/81)).
 
 `--dns-domain test` imposta solo il DNS *dentro* il container (`/etc/resolv.conf` → `nameserver 192.168.64.1`, `domain test`); la risoluzione dei nomi esterni resta funzionante. Per il nome sul Mac conta solo il nome del container.
 
@@ -257,7 +260,7 @@ dscacheutil -q host -a name mitmproxy.test
 curl -s -o /dev/null -w '%{http_code} %{remote_ip}\n' http://mitmproxy.test:8081/
 ```
 
-Per fermare: `./stop-mitm.sh` (punto 8).
+Per fermare: `./mitm stop` (punto 8).
 
 Note:
 - `--cap-add NET_ADMIN` è **obbligatorio**: senza questa capability, `iptables` fallisce con `Permission denied (you must be root)` anche se il processo gira come root a livello di utente Linux (il container di default ha un set di capability ridotto).
@@ -265,33 +268,28 @@ Note:
 - **In git solo la configurazione** di `./mitmproxy`: `config.yaml`, `keys.yaml`, `scripts/`. I file che mitmproxy genera nella stessa directory sono ignorati e restano solo sul disco: la CA (`mitmproxy-ca.pem` e `mitmproxy-ca.p12` contengono la **chiave privata**, con cui chiunque può intercettare il traffico dei dispositivi che hanno la CA installata), `mitmproxy-dhparam.pem`, `wireguard.conf` (chiavi private della modalità WireGuard) e `command_history`. Sono stati tolti anche dalla history del repo.
 - **CA su un altro Mac**: senza i file della CA, al primo avvio mitmproxy ne genera una **nuova**, da reinstallare su tutti i dispositivi. Per riusare quella già installata va copiata a mano (non via git) dalla directory `mitmproxy/` del vecchio Mac, o da `~/.mitmproxy`: `mitmproxy-ca.pem`, `mitmproxy-ca.p12`, `mitmproxy-ca-cert.*`, `mitmproxy-dhparam.pem`.
 - Una directory dedicata evita che il container carichi `~/.mitmproxy/config.yaml` dell'uso sul Mac (con i suoi `ignore_hosts`, `ssl_insecure`, …). Un eventuale `config.yaml` in `./mitmproxy` viene caricato: le opzioni da riga di comando (`mode`, `listen_port`, `web_port`, …) hanno la precedenza, tutto il resto viene applicato. Per non avere due valori diversi della stessa opzione, quelle impostate da `entrypoint.sh` non vanno ripetute in `config.yaml`.
-- `--volume ./export:/export`: directory di lavoro di mitmproxy, per avere sul Mac i file salvati dai suoi comandi, ad esempio `:save.file @shown flussi.mitm` (o `w`), `:export.file curl @focus richiesta.sh`, `:cut.save @focus response.content corpo.bin`. I percorsi relativi finiscono in `./export`; quelli assoluti (es. `/tmp/x`) restano nel container. Come `./mitmproxy`, la directory deve esistere: `start-mitm.sh` la crea. I file compaiono sul Mac con l'utente corrente come proprietario. È ignorata da git.
+- `--volume ./export:/export`: directory di lavoro di mitmproxy, per avere sul Mac i file salvati dai suoi comandi, ad esempio `:save.file @shown flussi.mitm` (o `w`), `:export.file curl @focus richiesta.sh`, `:cut.save @focus response.content corpo.bin`. I percorsi relativi finiscono in `./export`; quelli assoluti (es. `/tmp/x`) restano nel container. Come `./mitmproxy`, la directory deve esistere: `./mitm start` la crea. I file compaiono sul Mac con l'utente corrente come proprietario. È ignorata da git.
   Si monta una cartella del progetto e non la Scrivania: `~/Desktop` è protetta da TCC (l'accesso lo farebbe il processo di virtualizzazione di `container`, e su un Mac gestito l'autorizzazione può essere negata da policy), e non serve dare a un processo root che elabora traffico non fidato l'accesso in scrittura a tutta la Scrivania. Per averla a portata di mano: `ln -s "$PWD/export" ~/Desktop/mitm-export`.
 - `MITM_WEB_PASSWORD` in chiaro è visibile in `container inspect mitmproxy.test` e nella lista processi del container. Per evitarlo, `web_password` accetta anche un hash argon2 (mitmweb stesso lo suggerisce all'avvio).
 
-### 8. Arresto (`stop-mitm.sh`, `stop-dhcp.sh`)
+### 8. Arresto (`./mitm stop`)
 
-Come per l'avvio, due script separati. `stop-mitm.sh` **non ferma il DHCP**: i client mantengono il Mac come gateway e navigano via NAT, senza intercettazione. Per fermare tutto:
-```bash
-./stop-mitm.sh && ./stop-dhcp.sh
-```
+`./mitm stop` **non ferma il DHCP**: i client mantengono il Mac come gateway e navigano via NAT, senza intercettazione. Solo il DHCP: `./mitm stop dhcp`; tutto: `./mitm stop all`.
 
-Fermare solo il container **non basta**: la regola pf resterebbe attiva verso un IP non più in ascolto (con `route-to`, HTTP/HTTPS bloccati per tutta la LAN). Ogni script:
-- ferma il proprio container se è in esecuzione (con `--rm` lo rimuove anche — necessario per cambiare interfaccia, password o immagine);
-- svuota il proprio file di stato; il daemon `com.mitm.pf` (punto 9) allora:
-  - svuota il file generato (`/etc/pf.anchors/mitm.route` o `mitm.dhcp`), su cui gli script attendono la conferma;
+Fermare solo il container **non basta**: la regola pf resterebbe attiva verso un IP non più in ascolto (con `route-to`, HTTP/HTTPS bloccati per tutta la LAN). Per ogni servizio, `stop`:
+- ferma il container se è in esecuzione (con `--rm` lo rimuove anche — necessario per cambiare interfaccia, password o immagine);
+- svuota il file di stato; il daemon `com.mitm.pf` (punto 9) allora:
+  - svuota il file generato (`/etc/pf.anchors/mitm.route` o `mitm.dhcp`), su cui il comando attende la conferma;
   - svuota l'anchor in pf (`-F rules` per il `route-to`, `-F nat` per l'`rdr`: le `rdr` sono regole di traduzione, `-F rules` non le toccherebbe);
   - chiude gli stati pf legati alla vecchia regola: per mitmproxy quelli dei client LAN (`pfctl -k 192.168.3.0/24`, include anche gli stati del relay DHCP, che si ricreano al pacchetto successivo), per DHCP/DNS quelli LAN → Mac (`pfctl -k 192.168.3.0/24 -k 192.168.3.2`: relay del router e query DNS dei client).
 
-Dopo `stop-dhcp.sh` i client non possono rinnovare il lease: se il Mac smette di fare da gateway, va rimesso il router in modalità DHCP server.
+Dopo `./mitm stop dhcp` i client non possono rinnovare il lease: se il Mac smette di fare da gateway, va rimesso il router in modalità DHCP server.
 
-Come gli script di avvio, vanno eseguiti **senza sudo** e non chiedono privilegi. Si possono rilanciare anche se i container sono già fermi o non esistono.
+Come `start`, va eseguito **senza sudo**. Si può rilanciare anche se i container sono già fermi o non esistono.
 
-File: [stop-mitm.sh](stop-mitm.sh), [stop-dhcp.sh](stop-dhcp.sh).
+Per riprendere: `./mitm start` (riavvia anche il DHCP se serve), oppure `./mitm start dhcp` per il solo DHCP.
 
-Per riprendere: `./start-mitm.sh` (riavvia anche il DHCP se serve), oppure `./start-dhcp.sh` per il solo DHCP.
-
-Gli script lasciano volutamente attivi:
+`stop` lascia volutamente attivi:
 - **pf**: non si usa `pfctl -d`, che lo disabiliterebbe per tutto il sistema (inclusi servizi macOS/MDM che lo usano); con gli anchor vuoti pf non ha effetti sul traffico LAN;
 - **IP forwarding**: spegnerlo (`sudo sysctl -w net.inet.ip.forwarding=0`, e rimuovere la riga da `/etc/sysctl.conf` per renderlo permanente) toglie Internet ai client LAN.
 
@@ -310,7 +308,7 @@ script utente ──scrive IP──▶ /usr/local/var/mitm-pf/{route,dhcp}   (ut
 - **File di stato** (scritti con rename atomico, così il daemon non legge mai un file a metà):
   - `route` → `<IP mitmproxy>` (vuoto = nessuna intercettazione; il bridge lo ricava il daemon);
   - `dhcp` → `<IP dnsmasq>` (vuoto = nessun DHCP/DNS);
-  - `domains` → copia di [domini-mac.txt](domini-mac.txt), scritta da `start-mitm.sh` e dal LaunchAgent `com.mitm.domains` a ogni modifica del file (punto 10).
+  - `domains` → copia di [domini-mac.txt](domini-mac.txt), scritta da `./mitm start` e dal LaunchAgent `com.mitm.domains` a ogni modifica del file (punto 10).
 - **Validazione**: il contenuto è scrivibile dall'utente, quindi non viene mai eseguito né copiato così com'è; il daemon accetta solo indirizzi IPv4 e nomi di dominio (regex, al massimo 64) e genera la regola da un modello fisso. Qualsiasi altro contenuto svuota la regola (o, per i domini, viene ignorato).
 - **Configurazione e rete**: legge `LAN_IP` e `ROUTER_IP` dalla propria copia di `mitm.conf` (`/usr/local/etc/mitm.conf`, root:wheel) e a ogni esecuzione ricava WAN, interfaccia LAN e bridge (vedi *Configurazione*). La rete rilevata va nel log quando cambia.
 - **Ogni 60s** (`StartInterval`) e **a ogni cambio dei DNS di sistema** (`WatchPaths` su `/var/run/resolv.conf`, che cambia con la rete): il daemon rigenera le regole se è cambiata la rete e, con l'intercettazione attiva, ririsolve i domini e aggiorna la tabella `<mitm_local>`; se non cambia nulla non tocca pf.
@@ -331,13 +329,13 @@ Verifica: `sudo launchctl print system/com.mitm.pf | grep -E 'state|last exit'`.
 
 #### Avvio del DHCP al login (LaunchAgent `com.mitm.dhcp`)
 
-I servizi di `container` sono job launchd della **sessione utente**: dopo un reboot non sono registrati (`apiserver is not running and not registered with launchd`) e prima del login non possono girare. Il LaunchAgent, a ogni login, lancia `container system start` (idempotente: con i servizi già attivi termina con successo) e poi `start-dhcp.sh`. mitmproxy **non** parte al login: si avvia a mano con `./start-mitm.sh`.
+I servizi di `container` sono job launchd della **sessione utente**: dopo un reboot non sono registrati (`apiserver is not running and not registered with launchd`) e prima del login non possono girare. Il LaunchAgent, a ogni login, lancia `container system start` (idempotente: con i servizi già attivi termina con successo) e poi `./mitm start dhcp`. mitmproxy **non** parte al login: si avvia a mano con `./mitm start`.
 
-Definizione in [launchagent/com.mitm.dhcp.plist](launchagent/com.mitm.dhcp.plist) (`container` è in `/usr/local/bin`, quindi il plist imposta `PATH`, assente da quello di default di launchd). Il plist del progetto non contiene percorsi assoluti: launchd non espande `~` né `$HOME`, quindi `install.sh` sostituisce i segnaposto `__PROJECT_DIR__` e `__HOME__` con la directory del progetto e la home dell'utente. Se il progetto viene spostato, va rilanciato `./launchagent/install.sh`, e i container vanno ricreati (`./stop-mitm.sh --rm`, `./stop-dhcp.sh --rm`, poi `./start-mitm.sh`): i volumi (`./mitmproxy`, `./dhcp`) sono registrati con il percorso assoluto al momento del `container run`, e `container start` fallisce con `mount source path '...' does not exist`.
+Definizione in [launchagent/com.mitm.dhcp.plist](launchagent/com.mitm.dhcp.plist) (`container` è in `/usr/local/bin`, quindi il plist imposta `PATH`, assente da quello di default di launchd). Il plist del progetto non contiene percorsi assoluti: launchd non espande `~` né `$HOME`, quindi `install.sh` sostituisce i segnaposto `__PROJECT_DIR__` e `__HOME__` con la directory del progetto e la home dell'utente. Se il progetto viene spostato, va rilanciato `./launchagent/install.sh`, e i container vanno ricreati (`./mitm stop all --rm`, poi `./mitm start`): i volumi (`./mitmproxy`, `./dhcp`) sono registrati con il percorso assoluto al momento del `container run`, e `container start` fallisce con `mount source path '...' does not exist`.
 
 #### Modifiche di `domini-mac.txt` applicate al salvataggio (LaunchAgent `com.mitm.domains`)
 
-Il LaunchAgent ha `WatchPaths` su [domini-mac.txt](domini-mac.txt): a ogni salvataggio copia il file nello stato `domains` (rename atomico), e il daemon `com.mitm.pf`, attivato dalla modifica della directory di stato, aggiorna la tabella `<mitm_local>` (punto 10). Il watch scatta sia con la scrittura sul posto sia con il salvataggio atomico degli editor (file nuovo + rename). launchd lo esegue al massimo ogni 10s (`ThrottleInterval` di default): una modifica ravvicinata viene applicata con qualche secondo di ritardo. Con l'intercettazione spenta il daemon ignora l'elenco; `start-mitm.sh` lo copia comunque all'avvio.
+Il LaunchAgent ha `WatchPaths` su [domini-mac.txt](domini-mac.txt): a ogni salvataggio copia il file nello stato `domains` (rename atomico), e il daemon `com.mitm.pf`, attivato dalla modifica della directory di stato, aggiorna la tabella `<mitm_local>` (punto 10). Il watch scatta sia con la scrittura sul posto sia con il salvataggio atomico degli editor (file nuovo + rename). launchd lo esegue al massimo ogni 10s (`ThrottleInterval` di default): una modifica ravvicinata viene applicata con qualche secondo di ritardo. Con l'intercettazione spenta il daemon ignora l'elenco; `./mitm start` lo copia comunque all'avvio.
 
 Il watch è nella sessione utente e non nel daemon di root: così il daemon non deve conoscere la directory del progetto.
 
@@ -355,7 +353,7 @@ Log: `~/Library/Logs/mitm-dhcp.log` e `~/Library/Logs/mitm-domains.log`. Stato: 
 
 ### 10. Traffico del Mac verso domini scelti (`domini-mac.txt`)
 
-Il browser del Mac passa da mitmproxy solo per i domini elencati in [domini-mac.txt](domini-mac.txt), con o senza la LAN: servono solo il container e la WAN (rotta di default). Si attiva e si disattiva insieme all'intercettazione LAN (`start-mitm.sh` / `stop-mitm.sh`). Le modifiche dell'elenco si applicano al salvataggio del file, entro pochi secondi (LaunchAgent `com.mitm.domains`, punto 9); senza il LaunchAgent basta rilanciare `./start-mitm.sh`.
+Il browser del Mac passa da mitmproxy solo per i domini elencati in [domini-mac.txt](domini-mac.txt), con o senza la LAN: servono solo il container e la WAN (rotta di default). Si attiva e si disattiva insieme all'intercettazione LAN (`./mitm start` / `./mitm stop`). Le modifiche dell'elenco si applicano al salvataggio del file, entro pochi secondi (LaunchAgent `com.mitm.domains`, punto 9); senza il LaunchAgent basta rilanciare `./mitm start`.
 
 Perché non basta una rotta (`route add -host repubblica.it -interface bridge100`):
 1. `-interface` tratta la destinazione come diretta su `bridge100`: ARP per l'IP del sito, nessuno risponde. Servirebbe il container come gateway.
@@ -403,7 +401,7 @@ Con l'intercettazione attiva l'issuer è `mitmproxy`, e il flusso compare in mit
 10. **mitmproxy vecchio su Debian bookworm** → Python 3.11 ⇒ pip installa mitmproxy 11.0.2, senza `web_password`. Risolto con immagine base `python:3.13-slim-bookworm` e versione fissata.
 11. **Configurazione di rete manuale sui device** → il DHCP del router non permette un gateway diverso da sé stesso. Risolto con DHCP relay del router verso il Mac + `rdr` pf + `dnsmasq` in container (punto 6), che assegna il Mac come gateway.
 12. **Container DHCP che si ferma subito dopo l'avvio** → `dnsmasq` richiede `NET_ADMIN` per il DHCP. Risolto con `--cap-add NET_ADMIN` anche su `mitm-dhcp`.
-13. **DHCP ok ma il telefono non naviga** → mitmweb riceveva le connessioni (`192.168.3.168`) ma andava in timeout verso tutti i server (`Connect call failed … Errno 110`); dal container falliva anche `curl https://example.com`. Causa: il reload completo di `/etc/pf.conf` (fatto per aggiungere `com.mitm.dhcp`) aveva rimosso gli anchor NAT inseriti a runtime da `InternetSharing` per `192.168.64.0/24`. Risolto aggiungendo `nat on en0 inet from 192.168.64.0/24 to any -> (en0)` a `com.mitm.nat` e ricaricando solo quell'anchor (`pfctl -a com.mitm.nat -f …`). Alternativa senza pf: `container system stop` / `container system start` (poi `./start-mitm.sh`), ma il problema si ripresenterebbe al successivo reload completo.
+13. **DHCP ok ma il telefono non naviga** → mitmweb riceveva le connessioni (`192.168.3.168`) ma andava in timeout verso tutti i server (`Connect call failed … Errno 110`); dal container falliva anche `curl https://example.com`. Causa: il reload completo di `/etc/pf.conf` (fatto per aggiungere `com.mitm.dhcp`) aveva rimosso gli anchor NAT inseriti a runtime da `InternetSharing` per `192.168.64.0/24`. Risolto aggiungendo `nat on en0 inet from 192.168.64.0/24 to any -> (en0)` a `com.mitm.nat` e ricaricando solo quell'anchor (`pfctl -a com.mitm.nat -f …`). Alternativa senza pf: `container system stop` / `container system start` (poi `./mitm start`), ma il problema si ripresenterebbe al successivo reload completo.
 14. **Web UI raggiungibile solo digitando l'IP del container** (che cambia a ogni riavvio) → risolto con il DNS integrato di `container` (`container system dns create test`). Il primo tentativo non risolveva nulla (NXDOMAIN) neanche per container creati con `--dns-domain test`: il DNS registra solo i container il cui nome è già `<nome>.<dominio>`. Rinominato il container da `mitm-proxy` a `mitmproxy.test`.
 15. **Dopo un reboot il telefono non navigava e nulla ripartiva** → i servizi di `container` non si registrano da soli dopo il reboot, e `com.mitm.route` (oggi `com.apple/100.mitm.route`) conteneva ancora il `route-to` verso l'IP del container della sessione precedente (ricaricato da `pf.conf` all'avvio). Risolto con il LaunchDaemon `com.mitm.pf` (svuota al boot le regole con file di stato precedenti al boot) e il LaunchAgent `com.mitm.dhcp` (avvia `container` e il DHCP al login). Il daemon elimina anche i prompt `sudo` degli script.
 16. **DNS pubblici non raggiungibili su alcune reti** → i client ricevevano `1.1.1.1`/`1.0.0.1`, bloccati su reti che consentono solo i propri DNS; `dnsmasq` installato con brew sul Mac non riceveva nulla sulla porta 53 (Application Firewall). Risolto attivando il DNS nella stessa istanza `dnsmasq` del DHCP, con `rdr` pf `192.168.3.2:53` → container e upstream `192.168.64.1` (resolver del Mac, quindi i DNS di `en0`). Ai client viene offerto solo `192.168.3.2`.
@@ -423,7 +421,7 @@ Con l'intercettazione attiva l'issuer è `mitmproxy`, e il flusso compare in mit
 - **Anchor `com.apple/100.mitm.*` dopo un reboot da verificare**: al boot sono vuoti e li carica il daemon (`RunAtLoad`). Provata solo l'installazione a caldo (NAT, DHCP, intercettazione LAN e del Mac); dopo il primo reboot controllare `sudo pfctl -a com.apple/100.mitm.nat -sn` (due regole `nat`) e `sudo pfctl -vsA` (i vecchi `com.mitm.*` non devono più comparire).
 - **Il Mac è un punto singolo di guasto per la LAN**: con il DHCP in relay, a Mac spento o scollegato i client non ottengono/rinnovano il lease e non hanno gateway. Per tornare alla situazione standard: router in modalità DHCP server (i client riprendono gateway `192.168.3.1` al rinnovo successivo o riconnettendosi).
 - **Rinnovi DHCP via relay da verificare nel tempo**: il primo lease tramite il relay Zyxel funziona (iPhone → `192.168.3.168`). Non è ancora verificato che il router inoltri anche i rinnovi unicast indirizzati a `192.168.3.1`; se non lo facesse, i client rinnovano comunque in broadcast alla scadenza di T2 (~52 min con lease di 1h). Da controllare in `container logs mitm-dhcp` dopo ~30 min (T1).
-- **DNS dei client legato al Mac**: `192.168.3.2` è l'unico DNS offerto. Con `mitm-dhcp` fermo (`stop-dhcp.sh`, tra boot e login) i client non risolvono nomi, anche se hanno ancora un lease valido.
+- **DNS dei client legato al Mac**: `192.168.3.2` è l'unico DNS offerto. Con `mitm-dhcp` fermo (`./mitm stop dhcp`, tra boot e login) i client non risolvono nomi, anche se hanno ancora un lease valido.
 - **DNS LAN da provare su un client reale**: verificato `dnsmasq` → `192.168.64.1` (UDP e TCP, da `mitmproxy.test`), non ancora il percorso completo client → `192.168.3.2:53` → `rdr`. I client che hanno il lease precedente ricevono il nuovo DNS al rinnovo (entro ~30 min) o riconnettendosi.
 - **IPv6 e DNS**: se il router annuncia via RA un DNS IPv6 (RDNSS), i client possono usarlo al posto di `192.168.3.2`, scavalcando `dnsmasq`.
 - **IPv6 non funzionante** nella rete del container (timeout puri) — non bloccante per l'uso attuale (traffico IPv4), ma da tenere presente se in futuro serve intercettare anche IPv6.

@@ -16,7 +16,7 @@
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <!-- Rename atomico, come write_state di start-mitm.sh. Percorso come $0:
+        <!-- Rename atomico, come write_state di ./mitm. Percorso come $0:
              non viene interpretato dalla shell. File assente (salvataggio
              in corso) = nessuna modifica. -->
         <string>S=/usr/local/var/mitm-pf; cat "$0" > "$S/.domains.tmp" &amp;&amp; mv "$S/.domains.tmp" "$S/domains"</string>
