@@ -11,12 +11,15 @@
     <!-- Al boot: svuota le regole della sessione precedente -->
     <key>RunAtLoad</key>
     <true/>
-    <!-- A ogni modifica dei file di stato scritti dagli script utente -->
+    <!-- A ogni modifica dei file di stato scritti dagli script utente, e dei
+         DNS di sistema (cambio di rete: le regole seguono la nuova WAN) -->
     <key>WatchPaths</key>
     <array>
         <string>/usr/local/var/mitm-pf</string>
+        <string>/var/run/resolv.conf</string>
     </array>
-    <!-- Ririsolve i domini del Mac (tabella mitm_local): gli IP delle CDN cambiano -->
+    <!-- Ririsolve i domini del Mac (tabella mitm_local): gli IP delle CDN
+         cambiano. Rileva anche i cambi di rete senza cambio dei DNS -->
     <key>StartInterval</key>
     <integer>60</integer>
     <key>StandardOutPath</key>

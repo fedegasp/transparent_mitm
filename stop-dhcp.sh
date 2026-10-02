@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Ferma DHCP e DNS della LAN e rimuove le regole pf (relay e DNS). Autonomo:
 # non tocca mitmproxy. Senza DHCP i client non ottengono né rinnovano il lease
-# e il DNS 192.168.3.2 non risponde: se il Mac smette di fare da gateway,
+# e il DNS del Mac (LAN_IP) non risponde: se il Mac smette di fare da gateway,
 # rimettere il router in modalità DHCP server.
 #
 # Nessun sudo: lo script svuota /usr/local/var/mitm-pf/dhcp e il LaunchDaemon

@@ -5,11 +5,21 @@ set -e
 # con destinazione originale intatta) viene deviato verso mitmproxy in locale.
 # Questo passaggio è quello che crea la voce di conntrack che mitmproxy legge
 # per recuperare l'indirizzo originale.
-# Sorgenti: client LAN (192.168.3.0/24) e Mac (IP di en0, variabile): tutto
-# tranne la rete dei container. Destinazione non locale: non tocca le
-# connessioni dirette al container.
+# Sorgenti: client LAN e Mac (IP della sua WAN, variabile): tutto tranne la
+# rete dei container, ricavata dall'interfaccia della rotta di default (il
+# prefisso basta, iptables azzera i bit dell'host). Destinazione non locale:
+# non tocca le connessioni dirette al container.
+VM_NET=""
+for _ in $(seq 1 20); do
+  DEV=$(ip -4 route show default | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1); exit }')
+  [ -n "$DEV" ] && VM_NET=$(ip -4 -o addr show dev "$DEV" | awk '{ print $4; exit }')
+  [ -n "$VM_NET" ] && break
+  sleep 0.5
+done
+[ -n "$VM_NET" ] || { echo "Rete del container non configurata" >&2; exit 1; }
+echo "Rete dei container: $VM_NET ($DEV)"
 iptables -t nat -F PREROUTING
-iptables -t nat -A PREROUTING ! -s 192.168.64.0/24 -m addrtype ! --dst-type LOCAL \
+iptables -t nat -A PREROUTING ! -s "$VM_NET" -m addrtype ! --dst-type LOCAL \
   -p tcp -m multiport --dports 80,443 -j REDIRECT --to-port 7070
 
 # Directory corrente: /export (./export sul Mac). I percorsi relativi dei

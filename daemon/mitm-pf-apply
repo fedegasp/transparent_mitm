@@ -12,30 +12,38 @@
 # Non essendo caricati da /etc/pf.conf, al boot sono vuoti: li carica questo
 # script (RunAtLoad).
 #
-#   route    →  "<bridge> <IP mitmproxy>"   (vuoto/assente = nessuna intercettazione)
-#   dhcp     →  "<IP dnsmasq>"              (vuoto/assente = nessun DHCP/DNS)
+#   route    →  "<IP mitmproxy>"   (vuoto/assente = nessuna intercettazione)
+#   dhcp     →  "<IP dnsmasq>"     (vuoto/assente = nessun DHCP/DNS)
 #   domains  →  un dominio per riga: traffico del Mac da intercettare
 #
 # File più vecchi dell'ultimo boot sono ignorati: dopo un riavvio i container
 # sono fermi e le regole della sessione precedente vanno svuotate.
 #
-# Lanciato anche ogni 60s (StartInterval): ririsolve i domini e aggiorna la
-# tabella <mitm_local>, per seguire gli IP che cambiano (CDN).
+# Configurazione della LAN in /usr/local/etc/mitm.conf (copia di root di
+# mitm.conf del progetto, installata da install.sh). Ricavati a ogni
+# esecuzione, così le regole seguono i cambi di rete:
+#   WAN     interfaccia della rotta di default (en0 WiFi, Ethernet, ...)
+#   LAN_IF  interfaccia che ha l'IP LAN_IP del Mac (assente: niente regole LAN)
+#   BRIDGE  interfaccia verso i container (bridge di vmnet), e la sua subnet
+#
+# Lanciato anche ogni 60s (StartInterval) e a ogni cambio dei DNS di sistema
+# (WatchPaths): ririsolve i domini e aggiorna la tabella <mitm_local> (gli IP
+# delle CDN cambiano), e rigenera le regole se è cambiata la rete.
 set -u
 
+CONF=/usr/local/etc/mitm.conf
 STATE=/usr/local/var/mitm-pf
 ANCHORS=/etc/pf.anchors     # file delle regole generate, mitm.*
 PARENT=com.apple
-WAN=en0
-LAN=192.168.3.0/24
-ROUTER=192.168.3.1
-MAC_LAN_IP=192.168.3.2
-VM_NET=192.168.64.0/24
 IP_RE='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 IP6_RE='^[0-9a-fA-F:]{2,39}$'
-IF_RE='^bridge[0-9]{1,3}$'
+CIDR_RE='^([0-9]{1,3}\.){3}[0-9]{1,3}/([89]|[12][0-9]|30)$'
+IF_RE='^[a-z]{2,8}[0-9]{1,3}$'
+BRIDGE_RE='^bridge[0-9]{1,3}$'
 DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
 MAX_DOMAINS=64
+
+log() { echo "$(date '+%F %T') $*"; }
 
 # "{ sec = 1790839610, usec = 680084 } ..." → 1790839610
 BOOT=$(sysctl -n kern.boottime | sed -E 's/^\{ sec = ([0-9]+),.*/\1/')
@@ -46,6 +54,53 @@ read_state() {
   [ -f "$f" ] || return 0
   [ "$(stat -f %m "$f")" -ge "$BOOT" ] || return 0
   head -c 64 "$f" | head -n 1
+}
+
+# Valore di KEY=valore in $CONF (virgolette tolte), mai eseguito
+conf() {
+  [ -f "$CONF" ] || return 0
+  sed -nE "s/^$1=[\"']?([^\"'#[:space:]]*).*/\1/p" "$CONF" | tail -n 1
+}
+
+ip2int() {
+  local IFS=. a b c d
+  read -r a b c d <<<"$1"
+  echo $(((a << 24) | (b << 16) | (c << 8) | d))
+}
+
+int2ip() {
+  echo "$((($1 >> 24) & 255)).$((($1 >> 16) & 255)).$((($1 >> 8) & 255)).$(($1 & 255))"
+}
+
+# "192.168.3.2/24" → "192.168.3.0/24"
+network() {
+  local mask=$(((0xffffffff << (32 - ${1#*/})) & 0xffffffff))
+  echo "$(int2ip $(($(ip2int "${1%/*}") & mask)))/${1#*/}"
+}
+
+# Interfaccia che ha l'indirizzo IPv4 $1
+iface_with_ip() {
+  ifconfig | awk -v ip="$1" '
+    /^[a-z0-9]+:/ { i = substr($1, 1, length($1) - 1) }
+    $1 == "inet" && $2 == ip { print i; exit }'
+}
+
+# Subnet dell'interfaccia $1: "inet 192.168.64.1 netmask 0xffffff00" → 192.168.64.0/24
+iface_net() {
+  local ip mask bits=0
+  read -r ip mask <<<"$(ifconfig "$1" 2> /dev/null | awk '$1 == "inet" { print $2, $4; exit }')"
+  [[ $ip =~ $IP_RE ]] && [[ $mask =~ ^0x[0-9a-f]{8}$ ]] || return 0
+  mask=$((mask))
+  while [ $((mask & 0x80000000)) -ne 0 ]; do
+    bits=$((bits + 1))
+    mask=$(((mask << 1) & 0xffffffff))
+  done
+  network "$ip/$bits"
+}
+
+# Interfaccia usata per raggiungere $1 (rotta di default con "default")
+route_iface() {
+  route -n get "$1" 2> /dev/null | awk '$1 == "interface:" { print $2 }'
 }
 
 # Carica le regole $2 nell'anchor $PARENT/100.$1 (file $ANCHORS/$1), o lo
@@ -89,30 +144,77 @@ resolve_domains() {
   done
 }
 
+# --- Configurazione e rete corrente ---
+LAN_IP=$(conf LAN_IP)          # IP del Mac sulla LAN, con prefisso: 192.168.3.2/24
+ROUTER_IP=$(conf ROUTER_IP)    # router della LAN (relay DHCP)
+LAN_IF="" LAN_NET="" MAC_LAN_IP=""
+if [[ $LAN_IP =~ $CIDR_RE ]] && [[ $ROUTER_IP =~ $IP_RE ]]; then
+  MAC_LAN_IP=${LAN_IP%/*}
+  LAN_NET=$(network "$LAN_IP")
+  LAN_IF=$(iface_with_ip "$MAC_LAN_IP")
+  [[ $LAN_IF =~ $IF_RE ]] || LAN_IF=""
+else
+  log "configurazione $CONF assente o non valida (LAN_IP, ROUTER_IP): niente regole LAN"
+fi
+
+WAN=$(route_iface default)
+[[ $WAN =~ $IF_RE ]] && [ "$WAN" != "$LAN_IF" ] || WAN=""
+
+read -r MITM_IP _ <<<"$(read_state route)"
+read -r DHCP_IP _ <<<"$(read_state dhcp)"
+[[ ${MITM_IP:-} =~ $IP_RE ]] || MITM_IP=""
+[[ ${DHCP_IP:-} =~ $IP_RE ]] || DHCP_IP=""
+
+# Bridge di vmnet: interfaccia verso un container attivo, e la sua subnet
+BRIDGE="" VM_NET=""
+for ip in $MITM_IP $DHCP_IP; do
+  BRIDGE=$(route_iface "$ip")
+  [[ $BRIDGE =~ $BRIDGE_RE ]] && break
+  BRIDGE=""
+done
+[ -n "$BRIDGE" ] && VM_NET=$(iface_net "$BRIDGE")
+
+# Rete rilevata, nel log solo quando cambia. In $ANCHORS (di root), non nella
+# directory di stato: è scrivibile dall'utente, e una scrittura lì riattiverebbe
+# il daemon (WatchPaths).
+NET_INFO="WAN=${WAN:--} LAN=${LAN_IF:--} ${LAN_NET:-} bridge=${BRIDGE:--} ${VM_NET:-}"
+NET_FILE="$ANCHORS/mitm.net"
+if [ "$(cat "$NET_FILE" 2> /dev/null)" != "$NET_INFO" ]; then
+  log "rete: $NET_INFO"
+  printf '%s\n' "$NET_INFO" > "$NET_FILE"
+fi
+
 # --- NAT verso Internet: client LAN (traffico non intercettato) ed egress dei
 # container. Il NAT dei container lo fa anche InternetSharing con anchor propri
 # nel ruleset principale, che un reload completo di /etc/pf.conf rimuove: con
-# questa regola l'egress non dipende da loro. Sempre attivo.
-apply_anchor mitm.nat "nat on $WAN inet from $LAN to any -> ($WAN)
-nat on $WAN inet from $VM_NET to any -> ($WAN)" nat
+# questa regola l'egress non dipende da loro.
+RULE=""
+if [ -n "$WAN" ]; then
+  [ -n "$LAN_NET" ] && RULE="nat on $WAN inet from $LAN_NET to any -> ($WAN)"
+  [ -n "$VM_NET" ] && RULE="${RULE:+$RULE
+}nat on $WAN inet from $VM_NET to any -> ($WAN)"
+fi
+apply_anchor mitm.nat "$RULE" nat
 
 # --- mitmproxy: route-to dei client LAN e del traffico del Mac verso <mitm_local> ---
 #
 # Traffico del Mac: route-to in uscita su $WAN, senza tradurre (stesso motivo
 # della LAN: SO_ORIGINAL_DST nel container). Le connessioni di mitmproxy verso
-# Internet escono anch'esse da $WAN con sorgente (en0) dopo il NAT: vengono
+# Internet escono anch'esse da $WAN con sorgente ($WAN) dopo il NAT: vengono
 # marcate MITM_VM quando entrano da $BRIDGE ed escluse dal route-to, altrimenti
 # tornerebbero al container (loop). Il tag è "sticky": niente quick sulla regola
 # che lo applica, così non scavalca le regole successive su $BRIDGE
 # (com.apple/2xx.*, com.apple.internet-sharing).
 # IPv6 (il container non lo gestisce) e QUIC verso <mitm_local> sono respinti
 # con RST/ICMP: il browser ripiega subito su TCP IPv4, che viene intercettato.
-read -r BRIDGE MITM_IP _ <<<"$(read_state route)"
 RULE=""
-if [[ ${BRIDGE:-} =~ $IF_RE ]] && [[ ${MITM_IP:-} =~ $IP_RE ]]; then
-  RULE="table <mitm_local> persist
-pass in quick on en7 route-to ($BRIDGE $MITM_IP) inet proto tcp from $LAN to any port { 80, 443 } keep state
-pass in on $BRIDGE inet proto tcp from $MITM_IP to any port { 80, 443 } tag MITM_VM keep state
+if [ -n "$MITM_IP" ] && [ -n "$BRIDGE" ]; then
+  RULE="table <mitm_local> persist"
+  [ -n "$LAN_IF" ] && RULE="$RULE
+pass in quick on $LAN_IF route-to ($BRIDGE $MITM_IP) inet proto tcp from $LAN_NET to any port { 80, 443 } keep state"
+  RULE="$RULE
+pass in on $BRIDGE inet proto tcp from $MITM_IP to any port { 80, 443 } tag MITM_VM keep state"
+  [ -n "$WAN" ] && RULE="$RULE
 pass out quick on $WAN route-to ($BRIDGE $MITM_IP) inet proto tcp from ($WAN) to <mitm_local> port { 80, 443 } ! tagged MITM_VM keep state
 block return out quick on $WAN inet6 proto tcp from any to <mitm_local> port { 80, 443 }
 block return out quick on $WAN proto udp from any to <mitm_local> port 443"
@@ -124,7 +226,7 @@ OLD_IPS=$(pfctl -q -a "$ROUTE" -t mitm_local -T show 2> /dev/null)
 if apply_anchor mitm.route "$RULE" rules; then
   [ -z "$RULE" ] && pfctl -q -a "$ROUTE" -t mitm_local -T kill 2> /dev/null
   # Connessioni dei client e del Mac ancora legate alla regola precedente
-  pfctl -k "$LAN"
+  [ -n "$LAN_NET" ] && pfctl -k "$LAN_NET"
   for ip in $OLD_IPS; do
     if [[ $ip == *:* ]]; then any=::/0; else any=0.0.0.0/0; fi
     pfctl -q -k "$any" -k "$ip"
@@ -161,7 +263,7 @@ if [ -n "$RULE" ]; then
     printf '%s' "$IPS" > "$TABLE_FILE"
     [ -n "$IPS" ] && printf '\n' >> "$TABLE_FILE"
     pfctl -q -a "$ROUTE" -t mitm_local -T replace -f "$TABLE_FILE"
-    echo "$(date '+%F %T') mitm_local: $(grep -c . "$TABLE_FILE") IP"
+    log "mitm_local: $(grep -c . "$TABLE_FILE") IP"
   fi
   # IP non scaduti ma tolti con il loro dominio: chiude le connessioni aperte
   for ip in $(comm -23 <(awk 'NF == 3 { print $2 }' <<<"$RECENT" | sort -u) <(sort -u <<<"$IPS")); do
@@ -173,16 +275,14 @@ else
 fi
 
 # --- DHCP e DNS (dnsmasq): rdr del relay e delle query DNS dei client ---
-read -r DHCP_IP _ <<<"$(read_state dhcp)"
 RULE=""
-if [[ ${DHCP_IP:-} =~ $IP_RE ]]; then
-  RULE="rdr on en7 inet proto udp from $ROUTER to $MAC_LAN_IP port 67 -> $DHCP_IP port 67
-rdr on en7 inet proto { udp, tcp } from $LAN to $MAC_LAN_IP port 53 -> $DHCP_IP port 53"
+if [ -n "$DHCP_IP" ] && [ -n "$LAN_IF" ]; then
+  RULE="rdr on $LAN_IF inet proto udp from $ROUTER_IP to $MAC_LAN_IP port 67 -> $DHCP_IP port 67
+rdr on $LAN_IF inet proto { udp, tcp } from $LAN_NET to $MAC_LAN_IP port 53 -> $DHCP_IP port 53"
 fi
 if apply_anchor mitm.dhcp "$RULE" nat; then
-  # Relay e query DNS verso il Mac (il router è dentro $LAN)
-  pfctl -k "$LAN" -k "$MAC_LAN_IP"
+  # Relay e query DNS verso il Mac (il router è dentro la LAN)
+  [ -n "$LAN_NET" ] && pfctl -k "$LAN_NET" -k "$MAC_LAN_IP"
 fi
-
 pfctl -s info | grep -q 'Status: Enabled' || pfctl -E
 exit 0

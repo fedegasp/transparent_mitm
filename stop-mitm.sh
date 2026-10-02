@@ -64,4 +64,4 @@ fi
 write_state route ""
 wait_anchor "$ANCHOR" ""
 
-echo "Intercettazione disattivata: i client LAN escono su Internet via NAT su en0"
+echo "Intercettazione disattivata: i client LAN escono su Internet via NAT del Mac"

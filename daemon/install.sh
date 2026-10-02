@@ -16,6 +16,14 @@ install -d -o "$USER_NAME" -g staff -m 755 /usr/local/var/mitm-pf
 
 install -o root -g wheel -m 644 com.mitm.pf.plist /Library/LaunchDaemons/com.mitm.pf.plist
 
+# Configurazione della LAN: copia di root, il daemon non legge file
+# modificabili dall'utente come configurazione
+for key in LAN_IP ROUTER_IP; do
+  grep -qE "^$key=" ../mitm.conf || { echo "mitm.conf: manca $key" >&2; exit 1; }
+done
+install -d -o root -g wheel -m 755 /usr/local/etc
+install -o root -g wheel -m 644 ../mitm.conf /usr/local/etc/mitm.conf
+
 launchctl bootout system/com.mitm.pf 2> /dev/null || true
 
 # Regole attuali negli anchor com.apple/100.mitm.*, prima di togliere quelle

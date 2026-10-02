@@ -43,21 +43,19 @@ start_existing() {
   fi
 }
 
-# Stampa "IP GATEWAY" del container. L'IP viene assegnato poco dopo l'avvio:
-# attende fino a ~10s.
-container_net() {
-  local info ip gw
+# Stampa l'IP del container. Viene assegnato poco dopo l'avvio: attende fino
+# a ~10s.
+container_ip() {
+  local ip
   for _ in $(seq 1 20); do
-    info=$(container inspect "$1")
-    ip=$(jq -r '.[0].status.networks[0].ipv4Address // empty' <<<"$info" | cut -d'/' -f1)
-    gw=$(jq -r '.[0].status.networks[0].ipv4Gateway // empty' <<<"$info")
-    if [ -n "$ip" ] && [ -n "$gw" ]; then
-      echo "$ip $gw"
+    ip=$(container inspect "$1" | jq -r '.[0].status.networks[0].ipv4Address // empty' | cut -d'/' -f1)
+    if [ -n "$ip" ]; then
+      echo "$ip"
       return 0
     fi
     sleep 0.5
   done
-  echo "Impossibile determinare IP/gateway del container $1" >&2
+  echo "Impossibile determinare l'IP del container $1" >&2
   return 1
 }
 
@@ -99,29 +97,19 @@ if ! start_existing "$NAME"; then
     "$IMAGE" > /dev/null
 fi
 
-NET=$(container_net "$NAME")
-read -r CONTAINER_IP GATEWAY <<<"$NET"
-
-# Bridge vmnet = interfaccia del Mac che ha l'IP del gateway (es. bridge100)
-BRIDGE=$(ifconfig | awk -v gw="$GATEWAY" '
-  /^[a-z0-9]+:/ { iface = substr($1, 1, length($1) - 1) }
-  $1 == "inet" && $2 == gw { print iface; exit }')
-
-if [ -z "$BRIDGE" ]; then
-  echo "Nessuna interfaccia con IP $GATEWAY"
-  exit 1
-fi
-
-echo "IP mitmproxy: $CONTAINER_IP  bridge: $BRIDGE"
+CONTAINER_IP=$(container_ip "$NAME")
+echo "IP mitmproxy: $CONTAINER_IP"
 
 # Domini del traffico del Mac da intercettare: il daemon li risolve e li
 # carica nella tabella pf <mitm_local>
 write_state domains "$(cat domini-mac.txt 2> /dev/null)"
 
 # HTTP/HTTPS dei client LAN, e del Mac verso <mitm_local> → mitmproxy
-# (instradato, destinazione invariata; regole route-to generate dal daemon)
-write_state route "$BRIDGE $CONTAINER_IP"
-wait_anchor "$ANCHOR" "route-to ($BRIDGE $CONTAINER_IP)"
+# (instradato, destinazione invariata; regole route-to generate dal daemon,
+# che ricava anche il bridge verso il container). La regola del tag c'è
+# sempre, anche senza LAN né rete: basta attendere quella.
+write_state route "$CONTAINER_IP"
+wait_anchor "$ANCHOR" "from $CONTAINER_IP to any port"
 echo "Regola pf mitmproxy applicata"
 
 # Come raggiungere l'interfaccia: dipende da MITM_UI con cui è stato creato

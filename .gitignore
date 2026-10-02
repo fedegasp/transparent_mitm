@@ -4,3 +4,4 @@ command_history
 /export/
 __pycache__
 .venv/
+/dhcp/lan.conf
