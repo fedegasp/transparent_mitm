@@ -7,7 +7,7 @@ set -euo pipefail
 # del Mac anche senza intercettazione.
 #
 # Nessun sudo: lo script scrive l'IP del container in /usr/local/var/mitm-pf/dhcp
-# e il LaunchDaemon di root com.mitm.pf rigenera l'anchor com.mitm.dhcp.
+# e il LaunchDaemon di root com.mitm.pf rigenera l'anchor com.apple/100.mitm.dhcp.
 #
 # Uso: ./start-dhcp.sh
 
@@ -17,7 +17,7 @@ cd "$(dirname "$0")"
 DHCP_NAME=mitm-dhcp
 DHCP_IMAGE=mitm-dhcp
 STATE=/usr/local/var/mitm-pf
-ANCHOR=/etc/pf.anchors/com.mitm.dhcp
+ANCHOR=/etc/pf.anchors/mitm.dhcp
 
 # Avvia un container esistente se è fermo. Ritorna 1 se il container non esiste.
 start_existing() {

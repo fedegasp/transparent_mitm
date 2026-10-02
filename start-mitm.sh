@@ -7,7 +7,7 @@ set -euo pipefail
 #
 # Nessun sudo: lo script scrive bridge e IP del container in
 # /usr/local/var/mitm-pf/route e il LaunchDaemon di root com.mitm.pf rigenera
-# l'anchor com.mitm.route.
+# l'anchor com.apple/100.mitm.route.
 #
 # Uso: ./start-mitm.sh
 #      MITM_UI=web MITM_WEB_PASSWORD='<password>' ./start-mitm.sh
@@ -32,7 +32,7 @@ DNS_DOMAIN=test
 NAME="mitmproxy.$DNS_DOMAIN"
 IMAGE=mitm-transparent
 STATE=/usr/local/var/mitm-pf
-ANCHOR=/etc/pf.anchors/com.mitm.route
+ANCHOR=/etc/pf.anchors/mitm.route
 
 # Avvia un container esistente se è fermo. Ritorna 1 se il container non esiste.
 start_existing() {

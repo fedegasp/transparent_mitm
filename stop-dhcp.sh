@@ -7,14 +7,14 @@ set -euo pipefail
 # rimettere il router in modalità DHCP server.
 #
 # Nessun sudo: lo script svuota /usr/local/var/mitm-pf/dhcp e il LaunchDaemon
-# di root com.mitm.pf svuota l'anchor com.mitm.dhcp e chiude gli stati LAN → Mac.
+# di root com.mitm.pf svuota l'anchor com.apple/100.mitm.dhcp e chiude gli stati LAN → Mac.
 #
 # Uso: ./stop-dhcp.sh         ferma il container e rimuove le regole rdr
 #      ./stop-dhcp.sh --rm    rimuove anche il container (es. dopo un rebuild)
 
 DHCP_NAME=mitm-dhcp
 STATE=/usr/local/var/mitm-pf
-ANCHOR=/etc/pf.anchors/com.mitm.dhcp
+ANCHOR=/etc/pf.anchors/mitm.dhcp
 
 REMOVE=false
 for arg in "$@"; do

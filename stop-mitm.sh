@@ -6,7 +6,7 @@ set -euo pipefail
 # intercettazione. Per fermare anche il DHCP: ./stop-dhcp.sh
 #
 # Nessun sudo: lo script svuota /usr/local/var/mitm-pf/route e il LaunchDaemon
-# di root com.mitm.pf svuota l'anchor com.mitm.route e chiude gli stati dei client.
+# di root com.mitm.pf svuota l'anchor com.apple/100.mitm.route e chiude gli stati dei client.
 #
 # Uso: ./stop-mitm.sh         ferma il container e rimuove la regola route-to
 #      ./stop-mitm.sh --rm    rimuove anche il container
@@ -14,7 +14,7 @@ set -euo pipefail
 
 NAME=mitmproxy.test   # deve coincidere con NAME di start-mitm.sh
 STATE=/usr/local/var/mitm-pf
-ANCHOR=/etc/pf.anchors/com.mitm.route
+ANCHOR=/etc/pf.anchors/mitm.route
 
 REMOVE=false
 for arg in "$@"; do

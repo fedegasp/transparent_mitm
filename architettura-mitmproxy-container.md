@@ -40,7 +40,7 @@ client LAN (192.168.3.x) ──en7──▶ Mac pf: route-to (bridge100 <IP_CONT
                                        ▼
                      mitmproxy ──▶ gateway 192.168.64.1 ──▶ NAT vmnet ──en0──▶ Internet
 
-altro traffico LAN (non-HTTP/S) ──en7──▶ Mac: nat on en0 (anchor com.mitm.nat) ──▶ Internet
+altro traffico LAN (non-HTTP/S) ──en7──▶ Mac: nat on en0 (anchor com.apple/100.mitm.nat) ──▶ Internet
 
 traffico del Mac (browser) verso <mitm_local> (IP dei domini scelti), TCP 80/443:
   Mac ──out en0──▶ pf: route-to (bridge100 <IP_CONTAINER>)   [src IP di en0, dst invariato]
@@ -50,7 +50,7 @@ traffico del Mac (browser) verso <mitm_local> (IP dei domini scelti), TCP 80/443
                      Mac: in bridge100, tag MITM_VM ──▶ nat on en0 ──▶ out en0 (tagged: niente route-to) ──▶ Internet
 
 DNS:
-client ──UDP/TCP 53 → 192.168.3.2──en7──▶ Mac pf: rdr (anchor com.mitm.dhcp) → <IP_DHCP>:53
+client ──UDP/TCP 53 → 192.168.3.2──en7──▶ Mac pf: rdr (anchor com.apple/100.mitm.dhcp) → <IP_DHCP>:53
                                               ▼
                      container mitm-dhcp (dnsmasq, cache) ──▶ 192.168.64.1 (resolver del Mac via vmnet)
                                               ──▶ DNS correnti del Mac (quelli di en0)
@@ -59,7 +59,7 @@ DHCP:
 client ──broadcast──▶ router 192.168.3.1 (relay, giaddr=192.168.3.1)
                           │ unicast UDP → 192.168.3.2:67
                           ▼
-                     Mac pf: rdr (anchor com.mitm.dhcp) → <IP_DHCP>:67
+                     Mac pf: rdr (anchor com.apple/100.mitm.dhcp) → <IP_DHCP>:67
                           ▼
                      container mitm-dhcp (dnsmasq) ──risposta──▶ Mac (src riscritto in 192.168.3.2) ──▶ router ──▶ client
                      offre: IP 192.168.3.100–199, gateway 192.168.3.2, DNS 192.168.3.2, server-id 192.168.3.1
@@ -87,40 +87,35 @@ echo 'net.inet.ip.forwarding=1' | sudo tee -a /etc/sysctl.conf
 
 Il punto chiave dell'architettura: il traffico verso porta 80/443 **non viene tradotto** (niente `rdr`) ma solo **instradato** (`route-to`) verso l'IP del container, mantenendo intatto l'indirizzo di destinazione originale. Questo è necessario perché mitmproxy in modalità transparent su Linux recupera la destinazione originale via `getsockopt(SO_ORIGINAL_DST)`, che richiede che il NAT/redirect avvenga **nello stesso kernel** in cui gira mitmproxy (quindi dentro il container, non su macOS).
 
-`/etc/pf.conf`: copia di riferimento in [pf.conf](pf.conf). Ordine importante: `com.mitm.route` prima di `com.apple/*` per garantire priorità con `quick`, e `rdr-anchor "com.mitm.dhcp"` prima di `rdr-anchor "com.apple/*"` (per le traduzioni vince la prima regola che corrisponde).
+**`/etc/pf.conf` non viene modificato.** Le regole stanno in anchor figli di `com.apple`, `com.apple/100.mitm.*`, già raggiunti dalle righe `nat-anchor`, `rdr-anchor` e `anchor "com.apple/*"` del file di sistema. I figli di un anchor con `*` sono valutati in ordine di nome (per questo Apple li numera: `200.AirDrop`, `250.ApplicationFirewall`), quindi `100.*` viene prima di quelli di Apple, e `com.apple/*` viene prima degli anchor di `com.apple.internet-sharing` nel ruleset principale. Verificato con regole di prova su `bridge100`: il `block quick` e l'`rdr` di `com.apple/100.*` prevalgono su quelli di `com.apple/300.*`. Il `quick` in un anchor figlio chiude la valutazione di tutto il ruleset, come nel ruleset principale. I figli sopravvivono al reload di `com.apple` (verificato); un reload completo di `/etc/pf.conf` ricarica `com.apple` dal file allo stesso modo, quindi non dovrebbe toccarli (non provato, per non rimuovere gli anchor di `InternetSharing`). Così:
+- niente setup manuale di `/etc/pf.conf` (gli aggiornamenti di macOS possono ripristinarlo);
+- nessun bisogno di un reload completo, che rimuove gli anchor di `InternetSharing` (cronologia, punto 13).
 
-Il DHCP (e il DNS, servito dallo stesso container) ha un **anchor separato** (`com.mitm.dhcp`, dichiarato come `rdr-anchor`: le regole `rdr` in un anchor dichiarato solo con `anchor` verrebbero ignorate). Così DHCP e mitmproxy hanno ciascuno il proprio anchor e i propri script (punti 3 e 8): `stop-mitm.sh` rimuove l'intercettazione senza interrompere il DHCP.
+Gli anchor sono generati e caricati dal daemon `com.mitm.pf` (punto 9); i modelli delle regole sono in [daemon/mitm-pf-apply](daemon/mitm-pf-apply), i file generati in `/etc/pf.anchors/mitm.*`. Non essendo caricati da `/etc/pf.conf`, al boot gli anchor sono vuoti: li carica il daemon (`RunAtLoad`).
+- `com.apple/100.mitm.nat` (sempre attivo): NAT verso Internet per il resto del traffico LAN, non HTTP/S, e per l'egress dei container:
+  ```
+  nat on en0 inet from 192.168.3.0/24 to any -> (en0)
+  nat on en0 inet from 192.168.64.0/24 to any -> (en0)
+  ```
+  La seconda riga serve se mancano gli anchor di `InternetSharing` (avviato da `container-network-vmnet`), che fa normalmente il NAT della rete dei container inserendo i propri anchor pf nel ruleset principale a runtime: un reload completo (`pfctl -f /etc/pf.conf`, fatto da qualche servizio di sistema o a mano) li rimuove, e da quel momento i container non escono più su Internet (mitmproxy riceve le connessioni dei client ma va in timeout verso i server). Con la nostra regola l'egress non dipende da loro; se sono presenti, vale la prima regola che corrisponde, niente doppio NAT.
+- `com.apple/100.mitm.route`: `route-to (bridge100 <IP_CONTAINER>)` del TCP 80/443 in ingresso su `en7` dalla LAN. L'interfaccia nel `route-to` è quella **bridge di vmnet** (`bridge100`), non `en7`. Contiene anche le regole per il traffico del Mac verso la tabella `<mitm_local>` (punto 10).
+- `com.apple/100.mitm.dhcp`: `rdr` verso `<IP_DHCP>` del relay DHCP (UDP 67 da `192.168.3.1` a `192.168.3.2`) e delle query DNS (UDP/TCP 53 dalla LAN a `192.168.3.2`). Il DNS è ristretto alle query **verso il Mac**: un client con DNS configurato a mano (es. `8.8.8.8`) esce via NAT come prima.
 
-`/etc/pf.anchors/com.mitm.nat` (NAT verso Internet per il resto del traffico LAN, non HTTP/S, e per l'egress dei container):
-```
-nat on en0 inet from 192.168.3.0/24 to any -> (en0)
-nat on en0 inet from 192.168.64.0/24 to any -> (en0)
-```
-La seconda riga **è necessaria**: il NAT della rete dei container lo fa normalmente `InternetSharing` (avviato da `container-network-vmnet`), inserendo i propri anchor pf nel ruleset principale a runtime. Un reload completo (`pfctl -f /etc/pf.conf`) li rimuove, e da quel momento i container non escono più su Internet (mitmproxy riceve le connessioni dei client ma va in timeout verso i server). Con la regola nel nostro anchor l'egress non dipende più da quegli anchor; se sono presenti, vale la prima regola che corrisponde, niente doppio NAT.
+DHCP (e DNS, servito dallo stesso container) e mitmproxy hanno ciascuno il proprio anchor e i propri script (punti 3 e 8): `stop-mitm.sh` rimuove l'intercettazione senza interrompere il DHCP.
 
-`/etc/pf.anchors/com.mitm.route` e `/etc/pf.anchors/com.mitm.dhcp` sono generati dal daemon `com.mitm.pf` (punto 9) con l'IP corrente dei container, che non è fisso; i modelli delle regole sono in [daemon/mitm-pf-apply](daemon/mitm-pf-apply):
-- `com.mitm.route`: `route-to (bridge100 <IP_CONTAINER>)` del TCP 80/443 in ingresso su `en7` dalla LAN. L'interfaccia nel `route-to` è quella **bridge di vmnet** (`bridge100`), non `en7`. Contiene anche le regole per il traffico del Mac verso la tabella `<mitm_local>` (punto 10).
-- `com.mitm.dhcp`: `rdr` verso `<IP_DHCP>` del relay DHCP (UDP 67 da `192.168.3.1` a `192.168.3.2`) e delle query DNS (UDP/TCP 53 dalla LAN a `192.168.3.2`). Il DNS è ristretto alle query **verso il Mac**: un client con DNS configurato a mano (es. `8.8.8.8`) esce via NAT come prima.
+**pf su macOS non è abilitato di default**: `pfctl -f` carica le regole ma non le attiva. Il daemon lo abilita (`pfctl -E`) se serve.
 
-**pf su macOS non è abilitato di default**: `pfctl -f` carica le regole ma non le attiva. Setup una tantum dopo aver modificato `/etc/pf.conf` (il file dell'anchor DHCP deve esistere, altrimenti il caricamento fallisce):
-```bash
-sudo cp /etc/pf.conf /etc/pf.conf.bak
-sudo cp pf.conf /etc/pf.conf
-sudo touch /etc/pf.anchors/com.mitm.dhcp
-sudo pfctl -f /etc/pf.conf
-sudo pfctl -E
-```
-Il reload completo rimuove gli anchor di `InternetSharing` (vedi sopra): va fatto **solo dopo** aver aggiornato `com.mitm.nat` con la riga per `192.168.64.0/24`.
+Il daemon ricarica **solo il singolo anchor** (`pfctl -a <anchor> -f ...`), mai l'intero `/etc/pf.conf`: ricaricare il ruleset principale rimuove gli anchor inseriti dinamicamente dai servizi di sistema (vedi commento in testa a `/etc/pf.conf`).
 
-Dopo il setup iniziale gli anchor `com.mitm.route` e `com.mitm.dhcp` li gestisce il LaunchDaemon `com.mitm.pf` (punto 9), che ricarica **solo il singolo anchor** (`pfctl -a <anchor> -f ...`) e non l'intero `/etc/pf.conf`: ricaricare il ruleset principale può rimuovere gli anchor inseriti dinamicamente dai servizi di sistema (vedi commento in testa a `/etc/pf.conf`).
+Versione precedente: anchor `com.mitm.*` dichiarati in una copia modificata di `/etc/pf.conf`. `daemon/install.sh` toglie quelle righe (copia in `/etc/pf.conf.mitm-bak`) e svuota i vecchi anchor senza reload completo; i riferimenti vuoti rimasti nel ruleset principale spariscono al reboot.
 
 ### 3. Script di avvio (`start-dhcp.sh`, `start-mitm.sh`)
 
 L'IP dei container cambia a ogni riavvio (non esiste un flag per fissarlo — `container run --network` supporta solo `mac`/`mtu`, non `ip`): gli script leggono l'IP corrente e rigenerano l'anchor pf corrispondente.
 
 DHCP e mitmproxy hanno **script separati**, con una dipendenza a senso unico:
-- `start-dhcp.sh` è **autonomo**: gestisce solo `mitm-dhcp` e l'anchor `com.mitm.dhcp`, non sa nulla di mitmproxy. Con il solo DHCP attivo i client hanno il Mac come gateway e navigano via NAT, senza intercettazione.
-- `start-mitm.sh` **dipende dal DHCP**: come primo passo lancia `./start-dhcp.sh`, poi gestisce `mitmproxy.test` e l'anchor `com.mitm.route`.
+- `start-dhcp.sh` è **autonomo**: gestisce solo `mitm-dhcp` e l'anchor `com.apple/100.mitm.dhcp`, non sa nulla di mitmproxy. Con il solo DHCP attivo i client hanno il Mac come gateway e navigano via NAT, senza intercettazione.
+- `start-mitm.sh` **dipende dal DHCP**: come primo passo lancia `./start-dhcp.sh`, poi gestisce `mitmproxy.test` e l'anchor `com.apple/100.mitm.route`.
 
 Entrambi sono **idempotenti** e si possono rilanciare in qualsiasi momento:
 - container **inesistente** → lo crea con `container run` (per mitmproxy è l'unico momento in cui vengono lette `MITM_UI`, default `console`, e `MITM_WEB_PASSWORD`, default `password`);
@@ -263,8 +258,8 @@ Come per l'avvio, due script separati. `stop-mitm.sh` **non ferma il DHCP**: i c
 Fermare solo il container **non basta**: la regola pf resterebbe attiva verso un IP non più in ascolto (con `route-to`, HTTP/HTTPS bloccati per tutta la LAN). Ogni script:
 - ferma il proprio container se è in esecuzione (con `--rm` lo rimuove anche — necessario per cambiare interfaccia, password o immagine);
 - svuota il proprio file di stato; il daemon `com.mitm.pf` (punto 9) allora:
-  - **svuota il file** dell'anchor (`/etc/pf.anchors/com.mitm.route` o `com.mitm.dhcp`), così un reload di `/etc/pf.conf` (es. al riavvio del Mac) non ripristina la vecchia regola;
-  - svuota subito l'anchor in pf (`-F rules` per il `route-to`, `-F nat` per l'`rdr`: le `rdr` sono regole di traduzione, `-F rules` non le toccherebbe);
+  - svuota il file generato (`/etc/pf.anchors/mitm.route` o `mitm.dhcp`), su cui gli script attendono la conferma;
+  - svuota l'anchor in pf (`-F rules` per il `route-to`, `-F nat` per l'`rdr`: le `rdr` sono regole di traduzione, `-F rules` non le toccherebbe);
   - chiude gli stati pf legati alla vecchia regola: per mitmproxy quelli dei client LAN (`pfctl -k 192.168.3.0/24`, include anche gli stati del relay DHCP, che si ricreano al pacchetto successivo), per DHCP/DNS quelli LAN → Mac (`pfctl -k 192.168.3.0/24 -k 192.168.3.2`: relay del router e query DNS dei client).
 
 Dopo `stop-dhcp.sh` i client non possono rinnovare il lease: se il Mac smette di fare da gateway, va rimesso il router in modalità DHCP server.
@@ -287,8 +282,8 @@ Gli script utente non possono aggiornare pf da soli (serve root, con prompt Beyo
 script utente ──scrive IP──▶ /usr/local/var/mitm-pf/{route,dhcp}   (utente)
                                    │ launchd WatchPaths
                                    ▼
-                     com.mitm.pf (root): valida, rigenera /etc/pf.anchors/com.mitm.{route,dhcp},
-                                         pfctl -a <anchor> -f|-F, pfctl -k, pfctl -E se serve
+                     com.mitm.pf (root): valida, rigenera /etc/pf.anchors/mitm.{nat,route,dhcp},
+                                         pfctl -a com.apple/100.mitm.<x> -f|-F, pfctl -k, pfctl -E se serve
 ```
 
 - **File di stato** (scritti con rename atomico, così il daemon non legge mai un file a metà):
@@ -346,7 +341,7 @@ Perché non basta una rotta (`route add -host repubblica.it -interface bridge100
 3. Il REDIRECT nel container valeva solo per `-s 192.168.3.0/24`.
 4. Una rotta vale per un IP, non per un dominio, e le CDN usano più IP che cambiano.
 
-Regole pf (in `com.mitm.route`, generate dal daemon, modello in [daemon/mitm-pf-apply](daemon/mitm-pf-apply)):
+Regole pf (in `com.apple/100.mitm.route`, generate dal daemon, modello in [daemon/mitm-pf-apply](daemon/mitm-pf-apply)):
 ```
 table <mitm_local> persist
 pass in on bridge100 inet proto tcp from <IP_CONTAINER> to any port { 80, 443 } tag MITM_VM keep state
@@ -357,7 +352,7 @@ block return out quick on en0 proto udp from any to <mitm_local> port 443
 - **`route-to` in uscita** su `en0`: come per la LAN il pacchetto non viene tradotto, il REDIRECT avviene nel container (`SO_ORIGINAL_DST`). La sorgente resta l'IP di `en0`: il container risponde via `192.168.64.1` e lo stato pf (floating) copre il ritorno su `bridge100`.
 - **Tag anti-loop**: le regole di filtro in uscita vedono gli indirizzi **dopo il NAT**, quindi le connessioni di mitmproxy verso Internet hanno anch'esse sorgente `(en0)` su `en0`. Vengono marcate `MITM_VM` entrando da `bridge100` ed escluse dal `route-to` con `! tagged`. Il tag è *sticky* (resta anche se una regola successiva decide): la regola che lo applica non è `quick` e non scavalca le regole `com.apple/*` su `bridge100`. È ristretta all'IP di mitmproxy e alle porte 80/443.
 - **IPv6 e QUIC respinti** verso `<mitm_local>` (RST / ICMP unreachable): il container non gestisce IPv6 e il `route-to` è solo TCP. Il browser ripiega subito su TCP IPv4, che viene intercettato. Anche i client LAN, verso questi IP, perdono QUIC (escono via NAT su `en0`).
-- **Tabella `<mitm_local>`**: il daemon risolve i domini con `dscacheutil` (resolver e cache di sistema, gli stessi del browser) e tiene gli IP visti negli **ultimi 15 minuti**: CloudFront (repubblica.it) cambia insieme di IP a ogni scadenza del TTL (60s), e il browser può usarne uno ottenuto prima dell'ultima risoluzione. File generati: `/etc/pf.anchors/com.mitm.local` (IP correnti) e `com.mitm.local.seen` (`<ora dell'ultima risoluzione> <IP> <dominio>`). Grazie al dominio annotato, gli IP di un dominio **tolto dall'elenco** escono subito dalla tabella invece che dopo 15 minuti, e il daemon ne chiude gli stati: le connessioni già aperte del browser cadono e si riaprono senza intercettazione. Gli IP semplicemente scaduti, invece, non chiudono gli stati. La tabella **non** è caricata da `pf.conf`: i nomi non vengono risolti al boot (rete assente = caricamento fallito).
+- **Tabella `<mitm_local>`**: il daemon risolve i domini con `dscacheutil` (resolver e cache di sistema, gli stessi del browser) e tiene gli IP visti negli **ultimi 15 minuti**: CloudFront (repubblica.it) cambia insieme di IP a ogni scadenza del TTL (60s), e il browser può usarne uno ottenuto prima dell'ultima risoluzione. File generati: `/etc/pf.anchors/mitm.local` (IP correnti) e `mitm.local.seen` (`<ora dell'ultima risoluzione> <IP> <dominio>`). Grazie al dominio annotato, gli IP di un dominio **tolto dall'elenco** escono subito dalla tabella invece che dopo 15 minuti, e il daemon ne chiude gli stati: le connessioni già aperte del browser cadono e si riaprono senza intercettazione. Gli IP semplicemente scaduti, invece, non chiudono gli stati. La tabella **non** è caricata da `pf.conf`: i nomi non vengono risolti al boot (rete assente = caricamento fallito).
 - **Stop o cambio IP del container**: il daemon chiude anche gli stati verso gli IP della tabella (`pfctl -k 0.0.0.0/0 -k <IP>`), così le connessioni del browser verso il vecchio container cadono subito invece di restare appese.
 
 Ogni nome usato dal sito va elencato (`repubblica.it` e `www.repubblica.it` sono distinti, niente wildcard); risorse su altri domini (CDN di immagini, script) non sono intercettate se non sono in elenco.
@@ -366,8 +361,8 @@ Ogni nome usato dal sito va elencato (`repubblica.it` e `www.repubblica.it` sono
 
 Verifica:
 ```bash
-sudo pfctl -a com.mitm.route -t mitm_local -T show
-sudo pfctl -a com.mitm.route -vsr
+sudo pfctl -a com.apple/100.mitm.route -t mitm_local -T show
+sudo pfctl -a com.apple/100.mitm.route -vsr
 curl -sv -o /dev/null https://www.repubblica.it/ 2>&1 | grep -i issuer
 ```
 Con l'intercettazione attiva l'issuer è `mitmproxy`, e il flusso compare in mitmproxy (console o web UI) con client l'IP di `en0`. Oggi (senza intercettazione) è `Amazon RSA 2048 M04`: Digital Guardian non fa ispezione TLS su queste connessioni.
@@ -388,19 +383,21 @@ Con l'intercettazione attiva l'issuer è `mitmproxy`, e il flusso compare in mit
 12. **Container DHCP che si ferma subito dopo l'avvio** → `dnsmasq` richiede `NET_ADMIN` per il DHCP. Risolto con `--cap-add NET_ADMIN` anche su `mitm-dhcp`.
 13. **DHCP ok ma il telefono non naviga** → mitmweb riceveva le connessioni (`192.168.3.168`) ma andava in timeout verso tutti i server (`Connect call failed … Errno 110`); dal container falliva anche `curl https://example.com`. Causa: il reload completo di `/etc/pf.conf` (fatto per aggiungere `com.mitm.dhcp`) aveva rimosso gli anchor NAT inseriti a runtime da `InternetSharing` per `192.168.64.0/24`. Risolto aggiungendo `nat on en0 inet from 192.168.64.0/24 to any -> (en0)` a `com.mitm.nat` e ricaricando solo quell'anchor (`pfctl -a com.mitm.nat -f …`). Alternativa senza pf: `container system stop` / `container system start` (poi `./start-mitm.sh`), ma il problema si ripresenterebbe al successivo reload completo.
 14. **Web UI raggiungibile solo digitando l'IP del container** (che cambia a ogni riavvio) → risolto con il DNS integrato di `container` (`container system dns create test`). Il primo tentativo non risolveva nulla (NXDOMAIN) neanche per container creati con `--dns-domain test`: il DNS registra solo i container il cui nome è già `<nome>.<dominio>`. Rinominato il container da `mitm-proxy` a `mitmproxy.test`.
-15. **Dopo un reboot il telefono non navigava e nulla ripartiva** → i servizi di `container` non si registrano da soli dopo il reboot, e `com.mitm.route` conteneva ancora il `route-to` verso l'IP del container della sessione precedente (ricaricato da `pf.conf` all'avvio). Risolto con il LaunchDaemon `com.mitm.pf` (svuota al boot le regole con file di stato precedenti al boot) e il LaunchAgent `com.mitm.dhcp` (avvia `container` e il DHCP al login). Il daemon elimina anche i prompt `sudo` degli script.
+15. **Dopo un reboot il telefono non navigava e nulla ripartiva** → i servizi di `container` non si registrano da soli dopo il reboot, e `com.mitm.route` (oggi `com.apple/100.mitm.route`) conteneva ancora il `route-to` verso l'IP del container della sessione precedente (ricaricato da `pf.conf` all'avvio). Risolto con il LaunchDaemon `com.mitm.pf` (svuota al boot le regole con file di stato precedenti al boot) e il LaunchAgent `com.mitm.dhcp` (avvia `container` e il DHCP al login). Il daemon elimina anche i prompt `sudo` degli script.
 16. **DNS pubblici non raggiungibili su alcune reti** → i client ricevevano `1.1.1.1`/`1.0.0.1`, bloccati su reti che consentono solo i propri DNS; `dnsmasq` installato con brew sul Mac non riceveva nulla sulla porta 53 (Application Firewall). Risolto attivando il DNS nella stessa istanza `dnsmasq` del DHCP, con `rdr` pf `192.168.3.2:53` → container e upstream `192.168.64.1` (resolver del Mac, quindi i DNS di `en0`). Ai client viene offerto solo `192.168.3.2`.
+17. **Setup manuale di `/etc/pf.conf`** (copia modificata con gli anchor `com.mitm.*`, reload completo che rimuoveva gli anchor di `InternetSharing`, file dell'anchor DHCP da creare prima del caricamento) → non portabile su un altro Mac e a rischio di essere ripristinato dagli aggiornamenti di macOS. Risolto spostando le regole in anchor figli di `com.apple` (`com.apple/100.mitm.*`), già raggiunti dal `/etc/pf.conf` di sistema, generati e caricati dal daemon anche al boot (punto 2). Verificato l'ordine con regole di prova: `100.*` prevale su `300.*` per filtro e `rdr`, e il NAT in `100.*` viene applicato.
 
 ## Limiti noti / cose da verificare ancora
 
-- **Traffico del Mac (punto 10) provato solo con `curl`**: con `example.com` aggiunto a `domini-mac.txt`, `curl https://example.com/` dal Mac risponde con issuer `mitmproxy`, quindi `route-to`, tag anti-loop, REDIRECT nel container, egress di mitmproxy e ritorno verso l'IP di `en0` funzionano. Tolto il dominio, l'issuer torna quello originale (Cloudflare) entro ~15s. Da provare con un browser (Safari/Chrome, CA nel portachiavi) e da controllare i contatori di `pfctl -a com.mitm.route -vsr` (la regola `route-to` su `en0` deve contare solo le connessioni del browser).
+- **Traffico del Mac (punto 10) provato solo con `curl`**: con `example.com` aggiunto a `domini-mac.txt`, `curl https://example.com/` dal Mac risponde con issuer `mitmproxy`, quindi `route-to`, tag anti-loop, REDIRECT nel container, egress di mitmproxy e ritorno verso l'IP di `en0` funzionano. Tolto il dominio, l'issuer torna quello originale (Cloudflare) entro ~15s. Da provare con un browser (Safari/Chrome, CA nel portachiavi) e da controllare i contatori di `pfctl -a com.apple/100.mitm.route -vsr` (la regola `route-to` su `en0` deve contare solo le connessioni del browser).
 - **Intercettazione del Mac per IP, non per nome**: gli IP CloudFront sono condivisi tra molti siti (il certificato di `www.repubblica.it` è quello di `www.lastampa.it`), quindi viene intercettato anche il traffico di altri siti o app che in quel momento usano gli stessi IP. Un'app con certificate pinning su uno di quegli IP fallirebbe. Rimedio possibile: un addon mitmproxy che, per i client non LAN, lascia passare senza intercettare (`ignore_connection`) le connessioni il cui SNI non è in elenco.
 - **Browser con DNS proprio** (Chrome/Firefox con DNS-over-HTTPS) possono ottenere IP diversi da quelli risolti dal daemon: quelle connessioni non vengono intercettate.
 - **Traffico del Mac solo su `en0`**: con una VPN (`utun*`) o un'altra interfaccia come rotta di default le regole non scattano.
 
-- **QUIC/HTTP3 su UDP 443** non viene intercettato (`route-to`/`REDIRECT` sono solo TCP) e, non essendoci una regola che lo blocchi, esce via NAT su `en0`. Client come Safari/Chrome su iOS possono usarlo di default per molti siti, con traffico che bypassa mitmproxy senza errori visibili. Per forzare il fallback su TCP si può aggiungere alla regola `com.mitm.route` in [daemon/mitm-pf-apply](daemon/mitm-pf-apply) (poi `sudo ./daemon/install.sh`): `block in quick on en7 inet proto udp from 192.168.3.0/24 to any port 443`.
+- **QUIC/HTTP3 su UDP 443** non viene intercettato (`route-to`/`REDIRECT` sono solo TCP) e, non essendoci una regola che lo blocchi, esce via NAT su `en0`. Client come Safari/Chrome su iOS possono usarlo di default per molti siti, con traffico che bypassa mitmproxy senza errori visibili. Per forzare il fallback su TCP si può aggiungere alla regola `com.apple/100.mitm.route` in [daemon/mitm-pf-apply](daemon/mitm-pf-apply) (poi `sudo ./daemon/install.sh`): `block in quick on en7 inet proto udp from 192.168.3.0/24 to any port 443`.
 - **Tra boot e login niente DHCP**: i servizi di `container` girano solo nella sessione utente, quindi il DHCP parte al login (LaunchAgent, punto 9), non al boot. Prima del login i client non ottengono/rinnovano il lease. Il daemon pf invece parte al boot e svuota le regole della sessione precedente.
 - **Avvio al login provato solo con `launchctl bootstrap`**, non ancora con un vero logout/login o reboot.
+- **Anchor `com.apple/100.mitm.*` dopo un reboot da verificare**: al boot sono vuoti e li carica il daemon (`RunAtLoad`). Provata solo l'installazione a caldo (NAT, DHCP, intercettazione LAN e del Mac); dopo il primo reboot controllare `sudo pfctl -a com.apple/100.mitm.nat -sn` (due regole `nat`) e `sudo pfctl -vsA` (i vecchi `com.mitm.*` non devono più comparire).
 - **Il Mac è un punto singolo di guasto per la LAN**: con il DHCP in relay, a Mac spento o scollegato i client non ottengono/rinnovano il lease e non hanno gateway. Per tornare alla situazione standard: router in modalità DHCP server (i client riprendono gateway `192.168.3.1` al rinnovo successivo o riconnettendosi).
 - **Rinnovi DHCP via relay da verificare nel tempo**: il primo lease tramite il relay Zyxel funziona (iPhone → `192.168.3.168`). Non è ancora verificato che il router inoltri anche i rinnovi unicast indirizzati a `192.168.3.1`; se non lo facesse, i client rinnovano comunque in broadcast alla scadenza di T2 (~52 min con lease di 1h). Da controllare in `container logs mitm-dhcp` dopo ~30 min (T1).
 - **DNS dei client legato al Mac**: `192.168.3.2` è l'unico DNS offerto. Con `mitm-dhcp` fermo (`stop-dhcp.sh`, tra boot e login) i client non risolvono nomi, anche se hanno ancora un lease valido.
