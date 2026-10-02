@@ -88,3 +88,11 @@ sudo pfctl -a com.apple/100.mitm.route -t mitm_local -T show  # IPs of the Mac d
 LaunchAgent logs: `~/Library/Logs/mitm-dhcp.log`, `~/Library/Logs/mitm-domains.log`.
 
 If the Mac no longer acts as gateway (off, disconnected, `./mitm stop dhcp`), clients are left without DHCP: switch the router back to DHCP server mode.
+
+## Intended use
+
+This project intercepts and decrypts network traffic. Use it only on your own devices, or on networks and devices you are authorized to test, and inform the users of the LAN that their traffic goes through mitmproxy. Never commit or share the CA files (`mitmproxy-ca.pem`, `mitmproxy-ca.p12`): with the private key, anyone can intercept the traffic of every device that trusts the CA.
+
+## License
+
+[MIT](LICENSE). Dependencies are not included in the repository and keep their own licenses: they are downloaded when the images are built (`mitmproxy`, MIT; `dnsmasq`, GPL; Debian and Python packages).
