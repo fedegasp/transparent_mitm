@@ -325,7 +325,7 @@ Logs: `~/Library/Logs/mitm-dhcp.log` and `~/Library/Logs/mitm-domains.log`. Stat
 
 The Mac's browser goes through mitmproxy only for the domains listed in [mac-domains.txt](mac-domains.txt), with or without the LAN: only the container and the WAN (default route) are needed. It is enabled and disabled together with LAN interception (`./mitm start` / `./mitm stop`). Changes to the list are applied when the file is saved, within a few seconds (LaunchAgent `com.mitm.domains`, section 9); without the LaunchAgent, rerunning `./mitm start` is enough.
 
-Why a route is not enough (`route add -host repubblica.it -interface bridge100`):
+Why a route is not enough (`route add -host example.it -interface bridge100`):
 1. `-interface` treats the destination as directly attached to `bridge100`: ARP for the site's IP, nobody answers. The container would be needed as gateway.
 2. Even with the gateway a loop is created: mitmproxy's connection to the same IP goes through the Mac, finds the same route and returns to the container. The routing table decides on the destination only.
 3. The REDIRECT in the container applied only to `-s 192.168.3.0/24`.
@@ -342,10 +342,10 @@ block return out quick on en0 proto udp from any to <mitm_local> port 443
 - **Outbound `route-to`** on the WAN (`en0` in the examples): as for the LAN, the packet is not translated, the REDIRECT happens in the container (`SO_ORIGINAL_DST`). The source stays the IP of `en0`: the container replies via `192.168.64.1` and the (floating) pf state covers the return path on `bridge100`.
 - **Anti-loop tag**: outbound filter rules see addresses **after NAT**, so mitmproxy's connections to the Internet also have source `(en0)` on `en0`. They are tagged `MITM_VM` when entering from `bridge100` and excluded from the `route-to` with `! tagged`. The tag is *sticky* (it stays even if a later rule decides): the rule that applies it is not `quick` and does not override the `com.apple/*` rules on `bridge100`. It is restricted to mitmproxy's IP and to ports 80/443.
 - **IPv6 and QUIC rejected** to `<mitm_local>` (RST / ICMP unreachable): the container does not handle IPv6 and the `route-to` is TCP only. The browser immediately falls back to TCP over IPv4, which is intercepted. LAN clients also lose QUIC to these IPs (they go out via NAT on `en0`).
-- **`<mitm_local>` table**: the daemon resolves the domains with `dscacheutil` (system resolver and cache, the same as the browser's) and keeps the IPs seen in the **last 15 minutes**: CloudFront (repubblica.it) changes its set of IPs at every TTL expiry (60s), and the browser may use one obtained before the last resolution. Generated files: `/etc/pf.anchors/mitm.local` (current IPs) and `mitm.local.seen` (`<time of the last resolution> <IP> <domain>`). Thanks to the recorded domain, the IPs of a domain **removed from the list** leave the table immediately instead of after 15 minutes, and the daemon kills their states: the browser's already open connections drop and reopen without interception. IPs that have simply expired, instead, do not kill states. The table is **not** loaded by `pf.conf`: names are not resolved at boot (no network = failed load).
+- **`<mitm_local>` table**: the daemon resolves the domains with `dscacheutil` (system resolver and cache, the same as the browser's) and keeps the IPs seen in the **last 15 minutes**: CloudFront (example.it) changes its set of IPs at every TTL expiry (60s), and the browser may use one obtained before the last resolution. Generated files: `/etc/pf.anchors/mitm.local` (current IPs) and `mitm.local.seen` (`<time of the last resolution> <IP> <domain>`). Thanks to the recorded domain, the IPs of a domain **removed from the list** leave the table immediately instead of after 15 minutes, and the daemon kills their states: the browser's already open connections drop and reopen without interception. IPs that have simply expired, instead, do not kill states. The table is **not** loaded by `pf.conf`: names are not resolved at boot (no network = failed load).
 - **Container stop or IP change**: the daemon also kills the states to the table's IPs (`pfctl -k 0.0.0.0/0 -k <IP>`), so the browser's connections to the old container drop immediately instead of hanging.
 
-Every name used by the site must be listed (`repubblica.it` and `www.repubblica.it` are distinct, no wildcards); resources on other domains (image CDNs, scripts) are not intercepted unless they are in the list.
+Every name used by the site must be listed (`example.it` and `www.example.it` are distinct, no wildcards); resources on other domains (image CDNs, scripts) are not intercepted unless they are in the list.
 
 **mitmproxy CA on the Mac**: `./mitmproxy/mitmproxy-ca-cert.pem`, to be added as trusted to the keychain (Safari and Chrome use the system one; Firefox has its own store, or `security.enterprise_roots.enabled`). Without it, the browser shows a certificate error on the listed domains. On an MDM-managed Mac, adding a root CA may be restricted by policy.
 
@@ -353,14 +353,14 @@ Check:
 ```bash
 sudo pfctl -a com.apple/100.mitm.route -t mitm_local -T show
 sudo pfctl -a com.apple/100.mitm.route -vsr
-curl -sv -o /dev/null https://www.repubblica.it/ 2>&1 | grep -i issuer
+curl -sv -o /dev/null https://www.example.it/ 2>&1 | grep -i issuer
 ```
 With interception active the issuer is `mitmproxy`, and the flow appears in mitmproxy (console or web UI) with the IP of `en0` as client. Today (without interception) it is `Amazon RSA 2048 M04`: Digital Guardian does not do TLS inspection on these connections.
 
 ## Known limitations / still to be verified
 
 - **Mac traffic (section 10) tested only with `curl`**: with `example.com` added to `mac-domains.txt`, `curl https://example.com/` from the Mac responds with issuer `mitmproxy`, so `route-to`, anti-loop tag, REDIRECT in the container, mitmproxy egress and the return path to the IP of `en0` work. With the domain removed, the issuer goes back to the original one (Cloudflare) within ~15s. Still to be tested with a browser (Safari/Chrome, CA in the keychain), checking the counters of `pfctl -a com.apple/100.mitm.route -vsr` (the `route-to` rule on `en0` must count only the browser's connections).
-- **Mac interception by IP, not by name**: CloudFront IPs are shared among many sites (the certificate of `www.repubblica.it` is that of `www.lastampa.it`), so the traffic of other sites or apps that happen to use the same IPs is intercepted too. An app with certificate pinning on one of those IPs would fail. Possible fix: a mitmproxy addon that, for non-LAN clients, lets through without intercepting (`ignore_connection`) the connections whose SNI is not in the list.
+- **Mac interception by IP, not by name**: CloudFront IPs are shared among many sites (the certificate of `www.example.it` is that of `www.lastampa.it`), so the traffic of other sites or apps that happen to use the same IPs is intercepted too. An app with certificate pinning on one of those IPs would fail. Possible fix: a mitmproxy addon that, for non-LAN clients, lets through without intercepting (`ignore_connection`) the connections whose SNI is not in the list.
 - **Browsers with their own DNS** (Chrome/Firefox with DNS-over-HTTPS) may get IPs different from those resolved by the daemon: those connections are not intercepted.
 - **Mac traffic on the default route**: the rules follow the interface of the default route (WiFi, Ethernet). With a VPN (`utun*`) as default route, that would become the WAN: NAT and `route-to` on `utun` are not tested.
 - **Network change applied within 60s** (or immediately, if the system DNS changes): in the meantime the LAN clients' NAT and the Mac's rules stay on the previous WAN.
