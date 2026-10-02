@@ -5,7 +5,7 @@
   privilegio): a ogni modifica copia il file nello stato del daemon
   com.mitm.pf, che aggiorna la tabella <mitm_local>. Con l'intercettazione
   spenta il daemon ignora l'elenco.
-  Installazione: ./launchagent/install.sh, che sostituisce __PROJECT_DIR__
+  Installazione: ./mitm install (launchagent/install.sh), che sostituisce __PROJECT_DIR__
   e __HOME__ (launchd non espande ~ né $HOME).
 -->
 <plist version="1.0">

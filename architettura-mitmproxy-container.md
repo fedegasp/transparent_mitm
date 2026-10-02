@@ -41,12 +41,29 @@ Tutto il resto viene ricavato a runtime, e segue i cambi di rete:
 - **interfaccia LAN** (`en7` qui): quella che ha `LAN_IP`. Se manca (cavo scollegato) il daemon omette le regole LAN e le aggiunge entro 60s da quando compare;
 - **bridge e subnet dei container**: dalla rotta verso l'IP del container (daemon) e dall'interfaccia di default dentro il container (`entrypoint.sh`).
 
-`mitm.conf` è letto da `./mitm start dhcp` (genera `dhcp/lan.conf` per `dnsmasq`) e dal daemon di root, che ne usa una copia in `/usr/local/etc/mitm.conf` (installata da `sudo ./daemon/install.sh`: il daemon non legge configurazione modificabile dall'utente). Il file non viene mai eseguito, solo letto riga per riga (`KEY=valore`). Dopo una modifica:
-```bash
-sudo ./daemon/install.sh
-./mitm stop dhcp && ./mitm start dhcp
-```
+`mitm.conf` è letto da `./mitm start dhcp` (genera `dhcp/lan.conf` per `dnsmasq`) e dal daemon di root, che ne usa una copia in `/usr/local/etc/mitm.conf` (installata da `./mitm install`: il daemon non legge configurazione modificabile dall'utente). Il file non viene mai eseguito, solo letto riga per riga (`KEY=valore`). Dopo una modifica basta `./mitm install`: aggiorna la copia del daemon, e il LaunchAgent del DHCP, reinstallato, rigenera `dhcp/lan.conf` e riavvia `dnsmasq`.
 `./mitm start dhcp` e `./mitm status` avvisano se i valori del file del progetto e della copia del daemon sono diversi.
+
+## Installazione
+
+Su un Mac nuovo, o dopo una modifica di `mitm.conf` o del daemon (idempotente):
+```bash
+git clone … && cd mitm
+$EDITOR mitm.conf      # IP del Mac sulla LAN, router, range DHCP
+./mitm install
+./mitm start
+./mitm status
+```
+Requisiti: [`container`](https://github.com/apple/container/releases) e `jq` (`brew install jq`).
+
+`./mitm install` va lanciato da utente normale e chiede sudo **una volta sola** (su questo Mac con conferma di BeyondTrust), per la parte di root ([daemon/install.sh](daemon/install.sh)):
+- LaunchDaemon `com.mitm.pf` e copia di `mitm.conf` (punto 9);
+- IP forwarding, subito e in `/etc/sysctl.conf` (punto 1);
+- dominio DNS locale `.test` di `container` (punto 7).
+
+Il resto senza privilegi: `container system start`, build delle immagini se mancano, LaunchAgent (punto 9), che avviano subito il DHCP. Alla fine elenca quello che resta da fare a mano: IP statico del Mac sull'interfaccia LAN (se nessuna interfaccia ha `LAN_IP`), router in DHCP relay, e CA di mitmproxy da copiare in `mitmproxy/` per non doverne installare una nuova sui dispositivi (punto 7).
+
+`./mitm uninstall` ferma i servizi e rimuove agent, daemon, regole pf e file di stato. Restano container e immagini, la configurazione del progetto, l'IP forwarding e il dominio `.test`, che possono servire anche ad altro: il comando stampa come toglierli.
 
 ## Flusso del traffico
 
@@ -94,13 +111,7 @@ Il DNS segue lo stesso schema: i client interrogano il Mac (`192.168.3.2:53`), p
 
 ### 1. macOS — IP forwarding
 
-```bash
-sudo sysctl -w net.inet.ip.forwarding=1
-```
-Per renderlo persistente va aggiunto a `/etc/sysctl.conf` (oggi il file **non** lo contiene):
-```bash
-echo 'net.inet.ip.forwarding=1' | sudo tee -a /etc/sysctl.conf
-```
+Il Mac fa da gateway ai client LAN: `./mitm install` (punto 9) lo attiva subito (`sysctl -w net.inet.ip.forwarding=1`) e ai riavvii (riga in `/etc/sysctl.conf`).
 
 ### 2. macOS — `pf`: instradamento (non NAT) verso il container
 
@@ -217,10 +228,7 @@ Così si prova `dnsmasq` e il suo upstream, non l'`rdr` di `192.168.3.2:53`: que
 
 ### 7. Avvio
 
-Setup una tantum del dominio DNS locale di `container` (vedi *Web UI dal Mac*):
-```bash
-sudo container system dns create test
-```
+Il dominio DNS locale di `container` (`sudo container system dns create test`, vedi *Web UI dal Mac*) lo crea `./mitm install` (punto 9).
 
 I container vengono creati/avviati da `./mitm start` (punto 3), sulla rete `default` (nessun `--network`); le immagini, se mancano, le costruisce `start` stesso:
 ```bash
@@ -319,11 +327,7 @@ script utente ──scrive IP──▶ /usr/local/var/mitm-pf/{route,dhcp}   (ut
 
 File: [daemon/mitm-pf-apply](daemon/mitm-pf-apply) (script di root, contiene i modelli delle regole) e [daemon/com.mitm.pf.plist](daemon/com.mitm.pf.plist) (LaunchDaemon con `RunAtLoad`, e `WatchPaths` sulla directory di stato e su `/var/run/resolv.conf`).
 
-Installazione (una volta, da amministratore) con [daemon/install.sh](daemon/install.sh), che copia lo script in `/usr/local/libexec` e `mitm.conf` in `/usr/local/etc`, crea la directory di stato (di proprietà dell'utente) e carica il daemon:
-```bash
-sudo ./daemon/install.sh
-```
-Va rilanciato a ogni modifica di `daemon/mitm-pf-apply` o di `mitm.conf`: il daemon esegue la copia installata, non il file del progetto.
+Installazione con `./mitm install` (vedi *Installazione*), che lancia con sudo [daemon/install.sh](daemon/install.sh): copia lo script in `/usr/local/libexec` e `mitm.conf` in `/usr/local/etc`, crea la directory di stato (di proprietà dell'utente) e carica il daemon. Va rilanciato a ogni modifica di `daemon/mitm-pf-apply` o di `mitm.conf`: il daemon esegue la copia installata, non il file del progetto.
 
 Verifica: `sudo launchctl print system/com.mitm.pf | grep -E 'state|last exit'`.
 
@@ -331,7 +335,7 @@ Verifica: `sudo launchctl print system/com.mitm.pf | grep -E 'state|last exit'`.
 
 I servizi di `container` sono job launchd della **sessione utente**: dopo un reboot non sono registrati (`apiserver is not running and not registered with launchd`) e prima del login non possono girare. Il LaunchAgent, a ogni login, lancia `container system start` (idempotente: con i servizi già attivi termina con successo) e poi `./mitm start dhcp`. mitmproxy **non** parte al login: si avvia a mano con `./mitm start`.
 
-Definizione in [launchagent/com.mitm.dhcp.plist](launchagent/com.mitm.dhcp.plist) (`container` è in `/usr/local/bin`, quindi il plist imposta `PATH`, assente da quello di default di launchd). Il plist del progetto non contiene percorsi assoluti: launchd non espande `~` né `$HOME`, quindi `install.sh` sostituisce i segnaposto `__PROJECT_DIR__` e `__HOME__` con la directory del progetto e la home dell'utente. Se il progetto viene spostato, va rilanciato `./launchagent/install.sh`, e i container vanno ricreati (`./mitm stop all --rm`, poi `./mitm start`): i volumi (`./mitmproxy`, `./dhcp`) sono registrati con il percorso assoluto al momento del `container run`, e `container start` fallisce con `mount source path '...' does not exist`.
+Definizione in [launchagent/com.mitm.dhcp.plist](launchagent/com.mitm.dhcp.plist) (`container` è in `/usr/local/bin`, quindi il plist imposta `PATH`, assente da quello di default di launchd). Il plist del progetto non contiene percorsi assoluti: launchd non espande `~` né `$HOME`, quindi `install.sh` sostituisce i segnaposto `__PROJECT_DIR__` e `__HOME__` con la directory del progetto e la home dell'utente. Se il progetto viene spostato, va rilanciato `./mitm install`, e i container vanno ricreati (`./mitm stop all --rm`, poi `./mitm start`): i volumi (`./mitmproxy`, `./dhcp`) sono registrati con il percorso assoluto al momento del `container run`, e `container start` fallisce con `mount source path '...' does not exist`.
 
 #### Modifiche di `domini-mac.txt` applicate al salvataggio (LaunchAgent `com.mitm.domains`)
 
@@ -343,11 +347,7 @@ Definizione in [launchagent/com.mitm.domains.plist](launchagent/com.mitm.domains
 
 #### Installazione dei LaunchAgent
 
-`install.sh` installa (o rimuove) tutti i plist `com.mitm.*.plist` di `launchagent/`. Si usa da utente normale, senza sudo:
-```bash
-./launchagent/install.sh
-./launchagent/install.sh --remove
-```
+[launchagent/install.sh](launchagent/install.sh) installa (o, con `--remove`, rimuove) tutti i plist `com.mitm.*.plist` di `launchagent/`, da utente normale, senza sudo. Lo lanciano `./mitm install` e `./mitm uninstall`.
 
 Log: `~/Library/Logs/mitm-dhcp.log` e `~/Library/Logs/mitm-domains.log`. Stato: `launchctl print gui/$(id -u)/com.mitm.dhcp | grep -E 'state|last exit'` (idem per `com.mitm.domains`).
 
@@ -415,7 +415,7 @@ Con l'intercettazione attiva l'issuer è `mitmproxy`, e il flusso compare in mit
 - **Traffico del Mac sulla rotta di default**: le regole seguono l'interfaccia della rotta di default (WiFi, Ethernet). Con una VPN (`utun*`) come rotta di default diventerebbe quella la WAN: NAT e `route-to` su `utun` non sono provati.
 - **Cambio di rete applicato entro 60s** (o subito, se cambiano i DNS di sistema): nel frattempo il NAT dei client LAN e le regole del Mac restano sulla WAN precedente.
 
-- **QUIC/HTTP3 su UDP 443** non viene intercettato (`route-to`/`REDIRECT` sono solo TCP) e, non essendoci una regola che lo blocchi, esce via NAT su `en0`. Client come Safari/Chrome su iOS possono usarlo di default per molti siti, con traffico che bypassa mitmproxy senza errori visibili. Per forzare il fallback su TCP si può aggiungere alla regola `com.apple/100.mitm.route` in [daemon/mitm-pf-apply](daemon/mitm-pf-apply) (poi `sudo ./daemon/install.sh`): `block in quick on en7 inet proto udp from 192.168.3.0/24 to any port 443`.
+- **QUIC/HTTP3 su UDP 443** non viene intercettato (`route-to`/`REDIRECT` sono solo TCP) e, non essendoci una regola che lo blocchi, esce via NAT su `en0`. Client come Safari/Chrome su iOS possono usarlo di default per molti siti, con traffico che bypassa mitmproxy senza errori visibili. Per forzare il fallback su TCP si può aggiungere alla regola `com.apple/100.mitm.route` in [daemon/mitm-pf-apply](daemon/mitm-pf-apply) (poi `./mitm install`): `block in quick on en7 inet proto udp from 192.168.3.0/24 to any port 443`.
 - **Tra boot e login niente DHCP**: i servizi di `container` girano solo nella sessione utente, quindi il DHCP parte al login (LaunchAgent, punto 9), non al boot. Prima del login i client non ottengono/rinnovano il lease. Il daemon pf invece parte al boot e svuota le regole della sessione precedente.
 - **Avvio al login provato solo con `launchctl bootstrap`**, non ancora con un vero logout/login o reboot.
 - **Anchor `com.apple/100.mitm.*` dopo un reboot da verificare**: al boot sono vuoti e li carica il daemon (`RunAtLoad`). Provata solo l'installazione a caldo (NAT, DHCP, intercettazione LAN e del Mac); dopo il primo reboot controllare `sudo pfctl -a com.apple/100.mitm.nat -sn` (due regole `nat`) e `sudo pfctl -vsA` (i vecchi `com.mitm.*` non devono più comparire).

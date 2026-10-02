@@ -4,7 +4,7 @@
   Avvio del DHCP al login (LaunchAgent utente, nessun privilegio).
   Dopo un reboot i servizi di container non sono registrati: prima
   container system start (idempotente), poi ./mitm start dhcp.
-  Installazione: ./launchagent/install.sh, che sostituisce __PROJECT_DIR__
+  Installazione: ./mitm install (launchagent/install.sh), che sostituisce __PROJECT_DIR__
   e __HOME__ (launchd non espande ~ né $HOME).
 -->
 <plist version="1.0">
