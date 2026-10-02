@@ -3,3 +3,4 @@
 command_history
 /export/
 __pycache__
+.venv/
