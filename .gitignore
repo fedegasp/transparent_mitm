@@ -5,3 +5,9 @@ command_history
 __pycache__
 .venv/
 /dhcp/lan.conf
+# Generati da mitmproxy nella sua directory: CA (con chiave privata), chiavi
+# WireGuard, cronologia dei comandi. Restano solo sul disco; per un altro Mac
+# si copiano a mano (vedi architettura, punto 7)
+/mitmproxy/mitmproxy-ca*
+/mitmproxy/mitmproxy-dhparam.pem
+/mitmproxy/wireguard.conf
