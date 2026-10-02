@@ -8,18 +8,18 @@
     <array>
         <string>/usr/local/libexec/mitm-pf-apply</string>
     </array>
-    <!-- Al boot: svuota le regole della sessione precedente -->
+    <!-- At boot: flushes the rules of the previous session -->
     <key>RunAtLoad</key>
     <true/>
-    <!-- A ogni modifica dei file di stato scritti dagli script utente, e dei
-         DNS di sistema (cambio di rete: le regole seguono la nuova WAN) -->
+    <!-- On every change of the state files written by the user scripts, and
+         of the system DNS (network change: the rules follow the new WAN) -->
     <key>WatchPaths</key>
     <array>
         <string>/usr/local/var/mitm-pf</string>
         <string>/var/run/resolv.conf</string>
     </array>
-    <!-- Ririsolve i domini del Mac (tabella mitm_local): gli IP delle CDN
-         cambiano. Rileva anche i cambi di rete senza cambio dei DNS -->
+    <!-- Re-resolves the Mac domains (mitm_local table): CDN IPs change.
+         Also detects network changes without a DNS change -->
     <key>StartInterval</key>
     <integer>60</integer>
     <key>StandardOutPath</key>

@@ -1,6 +1,0 @@
-# Domini del traffico del Mac da intercettare con mitmproxy (un dominio per
-# riga, niente wildcard: ogni nome usato dal sito va elencato a parte).
-# Le modifiche si applicano da sole al salvataggio (LaunchAgent com.mitm.domains).
-repubblica.it
-www.repubblica.it
-cube.repubblica.it

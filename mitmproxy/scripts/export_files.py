@@ -1,34 +1,34 @@
 """
 mitmproxy addon: export.files
 ==============================
-Aggiunge il comando `export.files <flows> <path_template>` che esporta in
-formato raw tutte le chiamate selezionate.
+Adds the command `export.files <flows> <path_template>`, which exports all
+the selected requests in raw format.
 
-Formato del path template
---------------------------
-Il template deve contenere una sequenza di uno o più '#' consecutivi che
-verranno sostituiti con un numero progressivo a partire da 1, con padding
-di zeri pari al numero di '#' presenti.
+Path template format
+--------------------
+The template must contain a sequence of one or more consecutive '#' that
+will be replaced with a sequential number starting from 1, zero-padded to
+the number of '#' present.
 
-Esempi:
+Examples:
   export.files @shown /tmp/flow_###.raw   →  flow_001.raw, flow_002.raw …
   export.files @all   /tmp/req_#.raw      →  req_1.raw, req_2.raw …
   export.files @focus /tmp/dump_#####.bin →  dump_00001.bin …
 
-Formato raw esportato
----------------------
-Per ogni flow vengono scritti:
-  - la request HTTP grezza  (request line + headers + body)
-  - un separatore visivo
-  - la response HTTP grezza (status line + headers + body), se disponibile
+Exported raw format
+-------------------
+For each flow the following are written:
+  - the raw HTTP request  (request line + headers + body)
+  - a visual separator
+  - the raw HTTP response (status line + headers + body), if available
 
-Installazione
--------------
+Installation
+------------
   mitmproxy -s export_files.py
   mitmweb   -s export_files.py
   mitmdump  -s export_files.py
 
-Dal prompt di mitmproxy:
+From the mitmproxy prompt:
   : export.files @shown /tmp/flow_###.raw
 """
 
@@ -43,7 +43,7 @@ from mitmproxy import command, ctx, flow, http, types
 from mitmproxy.net.http import http1
 
 # ---------------------------------------------------------------------------
-# Costanti
+# Constants
 # ---------------------------------------------------------------------------
 
 _SEPARATOR = b"\r\n" + b"-" * 60 + b"\r\n"
@@ -54,11 +54,11 @@ _SEPARATOR = b"\r\n" + b"-" * 60 + b"\r\n"
 # ---------------------------------------------------------------------------
 
 def _resolve_path(template: str, index: int) -> Path:
-    """Sostituisce la prima sequenza di '#' con il numero progressivo zero-padded."""
+    """Replace the first sequence of '#' with the zero-padded sequential number."""
     match = re.search(r"(#+)", template)
     if not match:
         raise ValueError(
-            f"Il template '{template}' non contiene nessun carattere '#'."
+            f"The template '{template}' does not contain any '#' character."
         )
     hashes = match.group(1)
     replacement = str(index).zfill(len(hashes))
@@ -66,21 +66,21 @@ def _resolve_path(template: str, index: int) -> Path:
 
 
 def _request_to_raw(req: http.Request) -> bytes:
-    """Serializza la Request in formato wire HTTP/1.1."""
+    """Serialize the Request in HTTP/1.1 wire format."""
     head = http1.assemble_request_head(req)
     body = req.raw_content or b""
     return head + body
 
 
 def _response_to_raw(resp: http.Response) -> bytes:
-    """Serializza la Response in formato wire HTTP/1.1."""
+    """Serialize the Response in HTTP/1.1 wire format."""
     head = http1.assemble_response_head(resp)
     body = resp.raw_content or b""
     return head + body
 
 
 def _flow_to_raw(f: http.HTTPFlow) -> bytes:
-    """Converte un HTTPFlow nel payload raw da scrivere su disco."""
+    """Convert an HTTPFlow into the raw payload to write to disk."""
     parts: list[bytes] = [_request_to_raw(f.request), _SEPARATOR]
     if f.response is not None:
         parts.append(_response_to_raw(f.response))
@@ -94,7 +94,7 @@ def _flow_to_raw(f: http.HTTPFlow) -> bytes:
 # ---------------------------------------------------------------------------
 
 class ExportFiles:
-    """Addon che registra il comando ``export.files``."""
+    """Addon that registers the ``export.files`` command."""
 
     @command.command("export.files")
     def export_files(
@@ -103,12 +103,12 @@ class ExportFiles:
         path: types.Path,
     ) -> None:
         """
-        Esporta i flow selezionati in formato raw usando un path template.
+        Export the selected flows in raw format using a path template.
 
-        Il template deve contenere una o più '#' consecutive che verranno
-        sostituite con un numero progressivo zero-padded (es. ### → 001).
+        The template must contain one or more consecutive '#' that will be
+        replaced with a zero-padded sequential number (e.g. ### → 001).
 
-        Uso:
+        Usage:
             export.files @shown /tmp/flow_###.raw
             export.files @all   /tmp/capture_##.bin
             export.files @focus /tmp/single_#.raw
@@ -117,8 +117,8 @@ class ExportFiles:
 
         if not re.search(r"#+", template):
             logging.error(
-                f"[export.files] Il template '{template}' non contiene '#'. "
-                "Specifica almeno un '#' per il numero progressivo."
+                f"[export.files] The template '{template}' does not contain '#'. "
+                "Specify at least one '#' for the sequential number."
             )
             return
 
@@ -129,7 +129,7 @@ class ExportFiles:
         for idx, f in enumerate(flows, start=1):
             if not isinstance(f, http.HTTPFlow):
                 logging.warning(
-                    f"[export.files] Flow #{idx} non è un HTTPFlow — ignorato."
+                    f"[export.files] Flow #{idx} is not an HTTPFlow — skipped."
                 )
                 skipped += 1
                 continue
@@ -150,16 +150,16 @@ class ExportFiles:
                 exported += 1
             except OSError as exc:
                 logging.error(
-                    f"[export.files] Impossibile scrivere '{dest}': {exc}"
+                    f"[export.files] Cannot write '{dest}': {exc}"
                 )
                 errors += 1
 
-        parts = [f"{exported} file esportati"]
+        parts = [f"{exported} files exported"]
         if skipped:
-            parts.append(f"{skipped} ignorati")
+            parts.append(f"{skipped} skipped")
         if errors:
-            parts.append(f"{errors} errori")
-        logging.log(logging.CRITICAL, f"[export.files] Completato: {', '.join(parts)}.")
+            parts.append(f"{errors} errors")
+        logging.log(logging.CRITICAL, f"[export.files] Done: {', '.join(parts)}.")
 
 
 addons = [ExportFiles()]

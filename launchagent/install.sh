@@ -1,10 +1,10 @@
 #!/bin/bash
-# Installa i LaunchAgent del progetto (un plist per agente in questa directory):
-#   com.mitm.dhcp     DHCP avviato a ogni login
-#   com.mitm.domains  applica subito le modifiche di domini-mac.txt
-# Nessun privilegio: va lanciato come utente normale, SENZA sudo.
-#   ./launchagent/install.sh             installa e avvia subito
-#   ./launchagent/install.sh --remove    disinstalla
+# Installs the project's LaunchAgents (one plist per agent in this directory):
+#   com.mitm.dhcp     DHCP started at every login
+#   com.mitm.domains  applies changes to mac-domains.txt immediately
+# No privileges: run as a normal user, WITHOUT sudo.
+#   ./launchagent/install.sh             install and start now
+#   ./launchagent/install.sh --remove    uninstall
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -12,10 +12,10 @@ cd "$(dirname "$0")"
 DOMAIN="gui/$(id -u)"
 PROJECT_DIR="$(cd .. && pwd -P)"
 
-# I percorsi finiscono in XML e in un'espressione sed: niente caratteri speciali
+# The paths end up in XML and in a sed expression: no special characters
 for p in "$PROJECT_DIR" "$HOME"; do
   case "$p" in
-    *[\&\<\>\|\\]*) echo "Percorso non supportato: $p" >&2; exit 1 ;;
+    *[\&\<\>\|\\]*) echo "Unsupported path: $p" >&2; exit 1 ;;
   esac
 done
 
@@ -29,7 +29,7 @@ for src in com.mitm.*.plist; do
 
   if [ "${1:-}" = "--remove" ]; then
     rm -f "$PLIST"
-    echo "LaunchAgent $LABEL rimosso"
+    echo "LaunchAgent $LABEL removed"
     continue
   fi
 
@@ -38,5 +38,5 @@ for src in com.mitm.*.plist; do
   plutil -lint -s "$PLIST.tmp"
   mv "$PLIST.tmp" "$PLIST"
   launchctl bootstrap "$DOMAIN" "$PLIST"
-  echo "LaunchAgent $LABEL installato. Log: $(plutil -extract StandardOutPath raw "$PLIST")"
+  echo "LaunchAgent $LABEL installed. Log: $(plutil -extract StandardOutPath raw "$PLIST")"
 done

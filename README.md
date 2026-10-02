@@ -1,89 +1,89 @@
-# mitm: proxy trasparente LAN → mitmproxy in container (macOS)
+# mitm: transparent LAN proxy → mitmproxy in a container (macOS)
 
-Intercetta il traffico HTTP/HTTPS dei dispositivi collegati alla LAN fisica del Mac, e quello del Mac stesso verso i domini scelti in [domini-mac.txt](domini-mac.txt), con `mitmproxy` in una VM Linux gestita da Apple [`container`](https://github.com/apple/container). Il Mac fa da gateway, DHCP e DNS per la LAN; il router resta in DHCP relay verso il Mac.
+Intercepts the HTTP/HTTPS traffic of the devices connected to the Mac's physical LAN, and the Mac's own traffic to the domains listed in [mac-domains.txt](mac-domains.txt), with `mitmproxy` in a Linux VM managed by Apple [`container`](https://github.com/apple/container). The Mac acts as gateway, DHCP and DNS server for the LAN; the router stays in DHCP relay mode towards the Mac.
 
-- [ARCHITETTURA.md](ARCHITETTURA.md): perché e come funziona (pf, container, DHCP, daemon di root), limiti noti.
-- [CRONOLOGIA.md](CRONOLOGIA.md): problemi incontrati durante la costruzione e come sono stati risolti.
+- [ARCHITECTURE.md](ARCHITECTURE.md): why and how it works (pf, container, DHCP, root daemon), known limitations.
+- [HISTORY.md](HISTORY.md): problems encountered during construction and how they were solved.
 
-## Installazione
+## Installation
 
-Requisiti: [`container`](https://github.com/apple/container/releases) e `jq` (`brew install jq`).
+Requirements: [`container`](https://github.com/apple/container/releases) and `jq` (`brew install jq`).
 
 ```bash
 git clone … && cd mitm
-$EDITOR mitm.conf      # IP del Mac sulla LAN, router, range DHCP
+$EDITOR mitm.conf      # Mac's IP on the LAN, router, DHCP range
 ./mitm install
 ./mitm start
 ./mitm status
 ```
 
-`./mitm install` si lancia da utente normale e chiede sudo **una volta sola**, per daemon pf, IP forwarding e dominio DNS `.test`; il resto (immagini, LaunchAgent, avvio del DHCP) non richiede privilegi. È idempotente: va rilanciato dopo una modifica di `mitm.conf` o di `daemon/mitm-pf-apply`. Alla fine elenca quello che resta da fare a mano:
-- **IP statico del Mac** sull'interfaccia collegata alla LAN (`LAN_IP` di `mitm.conf`);
-- **router in DHCP relay** verso quell'IP, senza altri server DHCP sulla LAN;
-- **CA di mitmproxy**: per riusare quella già installata sui dispositivi, copiarne i file (`mitmproxy-ca.pem`, `mitmproxy-ca.p12`, `mitmproxy-ca-cert.*`, `mitmproxy-dhparam.pem`) in `mitmproxy/` prima del primo avvio, altrimenti mitmproxy ne genera una nuova. Non sono in git: la chiave privata permette di intercettare il traffico di ogni dispositivo che ha la CA installata.
+`./mitm install` is run as a normal user and asks for sudo **only once**, for the pf daemon, IP forwarding and the `.test` DNS domain; the rest (images, LaunchAgents, DHCP startup) needs no privileges. It is idempotent: rerun it after changing `mitm.conf` or `daemon/mitm-pf-apply`. At the end it lists what is left to do by hand:
+- **static IP for the Mac** on the interface connected to the LAN (`LAN_IP` in `mitm.conf`);
+- **router in DHCP relay mode** towards that IP, with no other DHCP server on the LAN;
+- **mitmproxy CA**: to reuse the one already installed on the devices, copy its files (`mitmproxy-ca.pem`, `mitmproxy-ca.p12`, `mitmproxy-ca-cert.*`, `mitmproxy-dhparam.pem`) into `mitmproxy/` before the first start, otherwise mitmproxy generates a new one. They are not in git: the private key allows intercepting the traffic of every device that has the CA installed.
 
-Disinstallazione: `./mitm uninstall` (restano container, immagini, IP forwarding e dominio `.test`; il comando stampa come toglierli).
+Uninstall: `./mitm uninstall` (containers, images, IP forwarding and the `.test` domain are left in place; the command prints how to remove them).
 
-## Configurazione
+## Configuration
 
-[mitm.conf](mitm.conf) è l'unico file da adattare a un altro Mac o a un'altra rete: IP del Mac sulla LAN con prefisso, IP del router, range e durata dei lease. Interfacce (WAN = rotta di default, LAN = interfaccia con l'IP indicato) e subnet dei container sono ricavate da sole e seguono i cambi di rete (WiFi/Ethernet, casa/ufficio).
+[mitm.conf](mitm.conf) is the only file to adapt to another Mac or another network: the Mac's IP on the LAN with prefix, the router's IP, lease range and duration. Interfaces (WAN = default route, LAN = interface with the given IP) and the container subnet are detected automatically and follow network changes (WiFi/Ethernet, home/office).
 
-Altri file:
-- [domini-mac.txt](domini-mac.txt): domini del traffico **del Mac** da far passare da mitmproxy, uno per riga, senza wildcard (`repubblica.it` e `www.repubblica.it` sono distinti). Le modifiche si applicano al salvataggio.
-- [mitmproxy/config.yaml](mitmproxy/config.yaml), [mitmproxy/keys.yaml](mitmproxy/keys.yaml), [mitmproxy/scripts/](mitmproxy/scripts): opzioni, tasti e addon di mitmproxy. Le opzioni impostate dall'entrypoint (modalità, porte) non vanno ripetute in `config.yaml`.
-- [dhcp/dnsmasq.conf](dhcp/dnsmasq.conf): opzioni di `dnsmasq` non legate alla rete, es. assegnazioni fisse (`dhcp-host=`). I parametri della LAN li genera `./mitm start dhcp` in `dhcp/lan.conf`.
+Other files:
+- [mac-domains.txt](mac-domains.txt): domains of **the Mac's** traffic to send through mitmproxy, one per line, no wildcards (`repubblica.it` and `www.repubblica.it` are distinct). Changes are applied on save.
+- [mitmproxy/config.yaml](mitmproxy/config.yaml), [mitmproxy/keys.yaml](mitmproxy/keys.yaml), [mitmproxy/scripts/](mitmproxy/scripts): mitmproxy options, key bindings and addons. Options set by the entrypoint (mode, ports) must not be repeated in `config.yaml`.
+- [dhcp/dnsmasq.conf](dhcp/dnsmasq.conf): `dnsmasq` options not tied to the network, e.g. static assignments (`dhcp-host=`). The LAN parameters are generated by `./mitm start dhcp` in `dhcp/lan.conf`.
 
-## Uso
+## Usage
 
 ```
-./mitm start [dhcp]            avvia DHCP e mitmproxy (con dhcp: solo il DHCP)
-./mitm stop [dhcp|all] [--rm]  ferma mitmproxy (dhcp: solo il DHCP; all: entrambi)
-./mitm status                  stato di container, regole pf, daemon e agent
-./mitm attach                  console di mitmproxy
-./mitm logs [dhcp|pf] [-f]     log di mitmproxy, di dnsmasq o del daemon pf
-./mitm build [proxy|dhcp]      ricostruisce le immagini
+./mitm start [dhcp]            start DHCP and mitmproxy (with dhcp: DHCP only)
+./mitm stop [dhcp|all] [--rm]  stop mitmproxy (dhcp: DHCP only; all: both)
+./mitm status                  status of containers, pf rules, daemon and agents
+./mitm attach                  mitmproxy console
+./mitm logs [dhcp|pf] [-f]     logs of mitmproxy, dnsmasq or the pf daemon
+./mitm build [proxy|dhcp]      rebuild the images
 ```
 
-Nessun comando richiede sudo, tranne `install`/`uninstall`. Il DHCP parte da solo al login (LaunchAgent); mitmproxy si avvia a mano con `./mitm start`. Con il solo DHCP attivo, o dopo `./mitm stop`, i client navigano normalmente via NAT del Mac, senza intercettazione.
+No command needs sudo, except `install`/`uninstall`. DHCP starts by itself at login (LaunchAgent); mitmproxy is started by hand with `./mitm start`. With only DHCP running, or after `./mitm stop`, clients browse normally through the Mac's NAT, without interception.
 
-### Interfaccia di mitmproxy
+### mitmproxy interface
 
-Scelta alla creazione del container con `MITM_UI`:
-- `console` (default): `./mitm attach` apre mitmproxy nella sessione `tmux` del container. `Ctrl-b d` stacca il terminale lasciando mitmproxy attivo; `q` lo riavvia (flussi persi), senza fermare il container.
-- `web`: `http://mitmproxy.test:8081`, password `password` o quella scelta.
+Chosen when the container is created, with `MITM_UI`:
+- `console` (default): `./mitm attach` opens mitmproxy in the container's `tmux` session. `Ctrl-b d` detaches the terminal leaving mitmproxy running; `q` restarts it (flows are lost), without stopping the container.
+- `web`: `http://mitmproxy.test:8081`, password `password` or the one chosen.
 
-Per cambiare interfaccia o password il container va ricreato:
+To change the interface or the password the container must be recreated:
 ```bash
 ./mitm stop --rm
 MITM_UI=web MITM_WEB_PASSWORD='<password>' ./mitm start
 ```
 
-I file salvati dai comandi di mitmproxy con percorso relativo (`:save.file @shown flussi.mitm`, `:export.file curl @focus richiesta.sh`, …) finiscono in `./export`.
+Files saved by mitmproxy commands with a relative path (`:save.file @shown flows.mitm`, `:export.file curl @focus request.sh`, …) end up in `./export`.
 
-### CA sui dispositivi e sul Mac
+### CA on devices and on the Mac
 
-I client vanno configurati per fidarsi della CA di mitmproxy (`mitmproxy/mitmproxy-ca-cert.pem`; `.cer` è lo stesso file con l'estensione richiesta da alcuni Android). Sul Mac, per i domini di `domini-mac.txt`, va aggiunta come attendibile al portachiavi (Safari e Chrome; Firefox ha un archivio proprio). Senza, il browser mostra un errore di certificato.
+Clients must be configured to trust the mitmproxy CA (`mitmproxy/mitmproxy-ca-cert.pem`; `.cer` is the same file with the extension required by some Android devices). On the Mac, for the domains in `mac-domains.txt`, it must be added as trusted to the keychain (Safari and Chrome; Firefox has its own store). Without it, the browser shows a certificate error.
 
-### Dopo una modifica
+### After a change
 
-- `entrypoint.sh` o `Containerfile`: `./mitm build proxy && ./mitm stop --rm && ./mitm start`.
+- `entrypoint.sh` or `Containerfile`: `./mitm build proxy && ./mitm stop --rm && ./mitm start`.
 - `dhcp/Containerfile`: `./mitm build dhcp && ./mitm stop dhcp --rm && ./mitm start dhcp`.
 - `dhcp/dnsmasq.conf`: `./mitm stop dhcp && ./mitm start dhcp`.
-- `mitm.conf` o `daemon/mitm-pf-apply`: `./mitm install`.
-- Progetto spostato in un'altra directory: `./mitm install`, poi `./mitm stop all --rm && ./mitm start` (i volumi dei container hanno il percorso assoluto).
+- `mitm.conf` or `daemon/mitm-pf-apply`: `./mitm install`.
+- Project moved to another directory: `./mitm install`, then `./mitm stop all --rm && ./mitm start` (container volumes have the absolute path).
 
-## Diagnosi
+## Troubleshooting
 
-`./mitm status` è il primo controllo: mostra rete rilevata, container, regole pf, daemon e LaunchAgent, e segnala le incoerenze (regola verso un container fermo, configurazione del daemon non aggiornata, agent falliti, IP forwarding spento). Poi:
+`./mitm status` is the first check: it shows the detected network, containers, pf rules, daemon and LaunchAgents, and reports inconsistencies (rule pointing to a stopped container, outdated daemon configuration, failed agents, IP forwarding off). Then:
 
 ```bash
-./mitm logs pf                                                # daemon: rete rilevata, regole applicate
-./mitm logs dhcp                                              # dnsmasq: lease assegnati
-curl -sv -o /dev/null https://www.repubblica.it/ 2>&1 | grep -i issuer   # dal Mac: issuer mitmproxy se intercettato
-sudo pfctl -a com.apple/100.mitm.route -vsr                   # regole route-to e contatori
-sudo pfctl -a com.apple/100.mitm.route -t mitm_local -T show  # IP dei domini del Mac
+./mitm logs pf                                                # daemon: detected network, applied rules
+./mitm logs dhcp                                              # dnsmasq: assigned leases
+curl -sv -o /dev/null https://www.repubblica.it/ 2>&1 | grep -i issuer   # from the Mac: mitmproxy issuer if intercepted
+sudo pfctl -a com.apple/100.mitm.route -vsr                   # route-to rules and counters
+sudo pfctl -a com.apple/100.mitm.route -t mitm_local -T show  # IPs of the Mac domains
 ```
 
-Log dei LaunchAgent: `~/Library/Logs/mitm-dhcp.log`, `~/Library/Logs/mitm-domains.log`.
+LaunchAgent logs: `~/Library/Logs/mitm-dhcp.log`, `~/Library/Logs/mitm-domains.log`.
 
-Se il Mac non fa più da gateway (spento, scollegato, `./mitm stop dhcp`), i client restano senza DHCP: rimettere il router in modalità DHCP server.
+If the Mac no longer acts as gateway (off, disconnected, `./mitm stop dhcp`), clients are left without DHCP: switch the router back to DHCP server mode.

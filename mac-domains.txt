@@ -1,0 +1,6 @@
+# Domains of the Mac's traffic to intercept with mitmproxy (one domain per
+# line, no wildcards: every name used by the site must be listed separately).
+# Changes are applied automatically on save (LaunchAgent com.mitm.domains).
+repubblica.it
+www.repubblica.it
+cube.repubblica.it

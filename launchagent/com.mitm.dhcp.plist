@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Avvio del DHCP al login (LaunchAgent utente, nessun privilegio).
-  Dopo un reboot i servizi di container non sono registrati: prima
-  container system start (idempotente), poi ./mitm start dhcp.
-  Installazione: ./mitm install (launchagent/install.sh), che sostituisce __PROJECT_DIR__
-  e __HOME__ (launchd non espande ~ né $HOME).
+  DHCP start at login (user LaunchAgent, no privileges).
+  After a reboot the container services are not registered: first
+  container system start (idempotent), then ./mitm start dhcp.
+  Installation: ./mitm install (launchagent/install.sh), which replaces __PROJECT_DIR__
+  and __HOME__ (launchd does not expand ~ or $HOME).
 -->
 <plist version="1.0">
 <dict>
@@ -15,11 +15,11 @@
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <!-- Percorso dello script come $0: non viene interpretato dalla shell -->
+        <!-- Script path as $0: not interpreted by the shell -->
         <string>container system start &amp;&amp; exec "$0" start dhcp</string>
         <string>__PROJECT_DIR__/mitm</string>
     </array>
-    <!-- container è in /usr/local/bin, assente dal PATH di default di launchd -->
+    <!-- container is in /usr/local/bin, missing from launchd's default PATH -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>

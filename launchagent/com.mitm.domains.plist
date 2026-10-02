@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Applica subito le modifiche di domini-mac.txt (LaunchAgent utente, nessun
-  privilegio): a ogni modifica copia il file nello stato del daemon
-  com.mitm.pf, che aggiorna la tabella <mitm_local>. Con l'intercettazione
-  spenta il daemon ignora l'elenco.
-  Installazione: ./mitm install (launchagent/install.sh), che sostituisce __PROJECT_DIR__
-  e __HOME__ (launchd non espande ~ né $HOME).
+  Applies changes to mac-domains.txt immediately (user LaunchAgent, no
+  privileges): on every change copies the file into the state of the daemon
+  com.mitm.pf, which updates the <mitm_local> table. With interception off
+  the daemon ignores the list.
+  Installation: ./mitm install (launchagent/install.sh), which replaces __PROJECT_DIR__
+  and __HOME__ (launchd does not expand ~ or $HOME).
 -->
 <plist version="1.0">
 <dict>
@@ -16,15 +16,15 @@
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <!-- Rename atomico, come write_state di ./mitm. Percorso come $0:
-             non viene interpretato dalla shell. File assente (salvataggio
-             in corso) = nessuna modifica. -->
+        <!-- Atomic rename, like write_state in ./mitm. Path as $0: not
+             interpreted by the shell. Missing file (save in progress) =
+             no change. -->
         <string>S=/usr/local/var/mitm-pf; cat "$0" > "$S/.domains.tmp" &amp;&amp; mv "$S/.domains.tmp" "$S/domains"</string>
-        <string>__PROJECT_DIR__/domini-mac.txt</string>
+        <string>__PROJECT_DIR__/mac-domains.txt</string>
     </array>
     <key>WatchPaths</key>
     <array>
-        <string>__PROJECT_DIR__/domini-mac.txt</string>
+        <string>__PROJECT_DIR__/mac-domains.txt</string>
     </array>
     <key>StandardOutPath</key>
     <string>__HOME__/Library/Logs/mitm-domains.log</string>
