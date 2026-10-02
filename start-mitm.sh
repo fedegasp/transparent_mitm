@@ -10,11 +10,15 @@ set -euo pipefail
 # l'anchor com.mitm.route.
 #
 # Uso: ./start-mitm.sh
-#      MITM_WEB_PASSWORD='<password>' ./start-mitm.sh
-# Password della web UI: default 'password'. Serve solo alla creazione del
-# container; nei rilanci successivi (container già esistente) viene ignorata.
+#      MITM_UI=web MITM_WEB_PASSWORD='<password>' ./start-mitm.sh
+# MITM_UI: console (default, mitmproxy in tmux:
+#   container exec -it mitmproxy.test tmux attach -t mitm)
+# oppure web (mitmweb, http://mitmproxy.test:8081).
+# Password della web UI: default 'password'.
+# MITM_UI e MITM_WEB_PASSWORD servono solo alla creazione del container; nei
+# rilanci successivi (container già esistente) vengono ignorate.
 
-# Il volume usa un percorso relativo alla directory del progetto
+# I volumi usano percorsi relativi alla directory del progetto
 cd "$(dirname "$0")"
 
 # Dipendenza: DHCP attivo
@@ -82,10 +86,15 @@ wait_anchor() {
 # mitmproxy: crea il container se non esiste, lo avvia se è fermo
 if ! start_existing "$NAME"; then
   echo "Creo il container $NAME"
+  # ./export: directory corrente di mitmproxy, i file salvati dai suoi comandi
+  # compaiono qui sul Mac (deve esistere, altrimenti container run fallisce)
+  mkdir -p export
   container run -d --name "$NAME" \
     --cap-add NET_ADMIN \
     --dns-domain "$DNS_DOMAIN" \
     --volume ./mitmproxy:/root/.mitmproxy \
+    --volume ./export:/export \
+    -e "MITM_UI=${MITM_UI:-console}" \
     -e "MITM_WEB_PASSWORD=${MITM_WEB_PASSWORD:-password}" \
     "$IMAGE" > /dev/null
 fi
@@ -114,3 +123,12 @@ write_state domains "$(cat domini-mac.txt 2> /dev/null)"
 write_state route "$BRIDGE $CONTAINER_IP"
 wait_anchor "$ANCHOR" "route-to ($BRIDGE $CONTAINER_IP)"
 echo "Regola pf mitmproxy applicata"
+
+# Come raggiungere l'interfaccia: dipende da MITM_UI con cui è stato creato
+# il container (default console)
+if container inspect "$NAME" \
+  | jq -e '.[0].configuration.initProcess.environment | index("MITM_UI=web")' > /dev/null; then
+  echo "Web UI: http://$NAME:8081"
+else
+  echo "Console: container exec -it $NAME tmux attach -t mitm   (Ctrl-b d per staccarsi)"
+fi

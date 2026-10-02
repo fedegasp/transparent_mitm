@@ -1,3 +1,5 @@
 *.leases
 .DS_Store
 command_history
+/export/
+__pycache__

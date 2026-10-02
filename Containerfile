@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     dnsutils \
     iproute2 \
+    tmux \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir "mitmproxy==12.2.3"

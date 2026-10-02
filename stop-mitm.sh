@@ -10,7 +10,7 @@ set -euo pipefail
 #
 # Uso: ./stop-mitm.sh         ferma il container e rimuove la regola route-to
 #      ./stop-mitm.sh --rm    rimuove anche il container
-#                             (necessario per cambiare password o immagine)
+#                             (necessario per cambiare interfaccia, password o immagine)
 
 NAME=mitmproxy.test   # deve coincidere con NAME di start-mitm.sh
 STATE=/usr/local/var/mitm-pf
