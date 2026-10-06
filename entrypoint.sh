@@ -28,6 +28,11 @@ iptables -t nat -A PREROUTING ! -s "$VM_NET" -m addrtype ! --dst-type LOCAL \
 mkdir -p /export
 cd /export
 
+# /edit (./edit on the Mac): copies of the files being edited on the Mac
+# (mac-editor.sh). Leftovers of a previous run are removed.
+mkdir -p /edit
+find /edit -mindepth 1 -delete
+
 # From here on, mitmproxy/mitmweb exiting must not terminate the script
 set +e
 

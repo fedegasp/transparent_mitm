@@ -2,6 +2,7 @@
 .DS_Store
 command_history
 /export/
+/edit/
 __pycache__
 .venv/
 /dhcp/lan.conf

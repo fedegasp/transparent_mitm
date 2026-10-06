@@ -61,13 +61,22 @@ MITM_UI=web MITM_WEB_PASSWORD='<password>' ./mitm start
 
 Files saved by mitmproxy commands with a relative path (`:save.file @shown flows.mitm`, `:export.file curl @focus request.sh`, …) end up in `./export`.
 
+### Editing on the Mac (console)
+
+The container has no editor: what the console edits in an external editor (`e` on a flow: body, URL, …; `e` on a cell of the header/query editors) and the external viewer (`v`) open in an application **on the Mac**, while the terminal is attached with `./mitm open` or `./mitm attach`. Edit the file, save it, go back to the terminal and press Enter to apply the changes (`d` + Enter to discard them); then close the file in the application. The application is chosen with `MITM_EDITOR`, read at every `open`/`attach` (default: the system's default text editor; the viewer uses the default application for the file type):
+```bash
+export MITM_EDITOR="Visual Studio Code"   # in ~/.zshrc to make it permanent
+./mitm open
+```
+The files being edited are in `./edit` and are removed after Enter.
+
 ### CA on devices and on the Mac
 
 Clients must be configured to trust the mitmproxy CA (`mitmproxy/mitmproxy-ca-cert.pem`; `.cer` is the same file with the extension required by some Android devices). On the Mac, for the domains in `mac-domains.txt`, it must be added as trusted to the keychain (Safari and Chrome; Firefox has its own store). Without it, the browser shows a certificate error.
 
 ### After a change
 
-- `entrypoint.sh` or `Containerfile`: `./mitm build proxy && ./mitm stop --rm && ./mitm start`.
+- `entrypoint.sh`, `mac-editor.sh` or `Containerfile`: `./mitm build proxy && ./mitm stop --rm && ./mitm start`.
 - `dhcp/Containerfile`: `./mitm build dhcp && ./mitm stop dhcp --rm && ./mitm start dhcp`.
 - `dhcp/dnsmasq.conf`: `./mitm stop dhcp && ./mitm start dhcp`.
 - `mitm.conf` or `daemon/mitm-pf-apply`: `./mitm install`.

@@ -31,6 +31,11 @@ Usage: ./mitm <command>
 mitmproxy interface, read only when the container is created:
   MITM_UI=console (default)          mitmproxy in tmux: ./mitm open (or attach)
   MITM_UI=web MITM_WEB_PASSWORD=...  mitmweb on http://mitmproxy.test:8081: ./mitm open
+
+Console, read at every open/attach:
+  MITM_EDITOR="<application>"        Mac application for editing (e), e.g.
+                                     "Visual Studio Code" (default: the
+                                     system's default text editor)
 EOF
 }
 
@@ -274,14 +279,15 @@ start_proxy() {
     ensure_image "$PROXY_IMAGE" .
     echo "Creating container $PROXY"
     # ./export: mitmproxy's working directory, files saved by its commands
-    # show up here on the Mac (must exist, otherwise container run
-    # fails)
-    mkdir -p export
+    # show up here on the Mac. ./edit: files being edited on the Mac
+    # (mac-editor.sh). They must exist, otherwise container run fails.
+    mkdir -p export edit
     container run -d --name "$PROXY" \
       --cap-add NET_ADMIN \
       --dns-domain "$DNS_DOMAIN" \
       --volume ./mitmproxy:/root/.mitmproxy \
       --volume ./export:/export \
+      --volume ./edit:/edit \
       -e "MITM_UI=${MITM_UI:-console}" \
       -e "MITM_WEB_PASSWORD=${MITM_WEB_PASSWORD:-password}" \
       "$PROXY_IMAGE" > /dev/null
@@ -499,12 +505,47 @@ cmd_stop() {
   esac
 }
 
+# Opens on the Mac the files that the console edits (mac-editor.sh in the
+# container writes edit/<file> and the request edit/<file>.open with the
+# mode, edit or view). Editing: application MITM_EDITOR, default the
+# system's default text editor; viewing (key v): default application for
+# the type. The rename claims the request (only one of several attached
+# terminals opens it); open errors go back to the container in
+# edit/<file>.error.
+edit_watcher() {
+  local req file mode out
+  while sleep 0.5; do
+    for req in edit/*.open; do
+      mv "$req" "$req.$$" 2> /dev/null || continue
+      file=${req%.open}
+      mode=$(cat "$req.$$" 2> /dev/null || true)
+      rm -f "$req.$$"
+      if [ "$mode" = view ]; then
+        out=$(/usr/bin/open "$file" 2>&1) || out=$(/usr/bin/open -t "$file" 2>&1)
+      elif [ -n "${MITM_EDITOR:-}" ]; then
+        out=$(/usr/bin/open -a "$MITM_EDITOR" "$file" 2>&1)
+      else
+        out=$(/usr/bin/open -t "$file" 2>&1)
+      fi || printf '%s\n' "$out" > "$file.error"
+    done
+  done
+}
+
+# mitmproxy console (tmux) in this terminal, with edit_watcher in the
+# background while attached (silent: it would write over the console)
+attach_console() {
+  mkdir -p edit
+  edit_watcher > /dev/null 2>&1 &
+  trap "kill $! 2> /dev/null" EXIT
+  container exec -it "$PROXY" tmux attach -t mitm
+}
+
 cmd_attach() {
   [ "$(container_state "$PROXY")" = running ] || die "mitmproxy is not running: ./mitm start"
   if [ "$(proxy_ui)" = web ]; then
     echo "Web UI: http://$PROXY:8081"
   else
-    exec container exec -it "$PROXY" tmux attach -t mitm
+    attach_console
   fi
 }
 
@@ -516,7 +557,7 @@ cmd_open() {
   if [ "$(proxy_ui)" = web ]; then
     /usr/bin/open "http://$PROXY:8081/"
   else
-    exec container exec -it "$PROXY" tmux attach -t mitm
+    attach_console
   fi
 }
 

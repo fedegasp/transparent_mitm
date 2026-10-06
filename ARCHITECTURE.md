@@ -158,7 +158,7 @@ It must be run **without sudo** (`container run/inspect` require the user sessio
 
 Base `python:3.13-slim-bookworm` and **not** `debian:bookworm-slim`: Debian bookworm has Python 3.11, and recent mitmproxy versions require Python ≥ 3.12 (since 11.1). With `pip install mitmproxy` on bookworm you silently get **11.0.2**, which lacks the `web_password` option (mitmweb exits with an error) and the web UI protection introduced in later versions. The version is pinned for reproducible builds.
 
-File: [Containerfile](Containerfile). `container build` finds it automatically (otherwise `-f Containerfile`).
+File: [Containerfile](Containerfile). `container build` finds it automatically (otherwise `-f Containerfile`). It also installs [mac-editor.sh](mac-editor.sh) as `MITMPROXY_EDITOR` (section 7, *Editing on the Mac*): the image has no editor.
 
 ### 5. Container — entrypoint (`entrypoint.sh`)
 
@@ -174,6 +174,7 @@ Critical points:
 - **`tini` as PID 1** (via `ENTRYPOINT`) and **mitmproxy/mitmweb in a `while` loop**: it is a child process that can be killed/restarted without stopping the container. Without the loop, when mitmweb exits the entrypoint terminates and the container with it.
 - **Console: two loops**. The one inside the `tmux` session restarts `mitmproxy` after an exit (`q`) without closing the session, so whoever is attached immediately sees the new instance. The outer one, in the entrypoint, recreates the session if it is closed (`tmux kill-session`) and keeps the container alive: `tmux new-session -d` returns immediately, and without the loop the entrypoint would terminate. In console mode `container logs mitmproxy.test` does not show mitmproxy's output (it is in the `tmux` session, events with `E`).
 - **Current directory `/export`** (volume `./export`, section 7): relative paths of commands that write to disk end up there.
+- **`/edit` emptied at startup** (volume `./edit`, section 7): leftovers of edits interrupted by a container stop.
 - **`block_global=false`**: `block_global` blocks connections from **clients** with a public IP (it does not concern the destination). LAN clients `192.168.3.x` are private, so it is not strictly needed; it is kept to avoid surprises if a client shows up with a non-private IP.
 - **Web UI password** (only `MITM_UI=web`) **from an environment variable** (`MITM_WEB_PASSWORD`, passed with `container run -e`), not written into the image. `./mitm start` always passes it, defaulting to `password` if not set. If the variable were missing entirely (container started by hand), mitmweb generates a random token printed in the logs (`container logs mitmproxy.test`). The web UI is also reachable from LAN clients (the Mac forwards `192.168.3.0/24` → `192.168.64.0/24`): with the default password anyone on the LAN can access it.
 
@@ -220,6 +221,27 @@ Interface chosen with `MITM_UI`, read only when the container is created (to cha
 - `console` (default): `mitmproxy` in `tmux` (section 5). `./mitm open` and `./mitm attach` are `container exec -it mitmproxy.test tmux attach -t mitm`: no ssh, which is not needed and would expose one more port, to the LAN too.
 - `web`: `mitmweb` on `:8081`, password from `MITM_WEB_PASSWORD` (default `password`). `./mitm open` opens `http://mitmproxy.test:8081/` in the default browser, without the password in the URL (`?token=`): it would end up in the browser history.
 
+#### Editing on the Mac (console)
+
+The console edits a part of a flow (body, URL, header cell, …) by writing it to a temporary file and running `$MITMPROXY_EDITOR <file>`, then reads the file back when the command exits; the external viewer (`v`) uses the same variable, with a read-only file. The image has no editor, and the editing should happen in a desktop application on the Mac: `MITMPROXY_EDITOR` (set in the `Containerfile`) is [mac-editor.sh](mac-editor.sh), which hands the file over to the Mac through the `./edit` volume:
+
+```
+mitmproxy ──/tmp/mitmproxyXXXX──▶ mac-editor: cp → /edit/mitmproxyXXXX, request /edit/mitmproxyXXXX.open (edit|view)
+                                       │ ./edit (volume)
+                                       ▼
+          ./mitm open|attach (Mac, background, every 0.5s): claims the request (mv), open -a "$MITM_EDITOR" | open -t | open
+                                       │ the user edits and saves on the Mac
+                                       ▼
+          mac-editor: Enter → /edit/mitmproxyXXXX → /tmp/mitmproxyXXXX, removes the copy ──▶ mitmproxy reads the file
+```
+
+- **The Mac side lives in `./mitm open`/`attach`**, as a background loop for the duration of the attach (killed on exit), not in a LaunchAgent: files are edited only from an attached terminal, the application (`MITM_EDITOR`) is read at every attach without recreating the container, and no throttling (a `WatchPaths` LaunchAgent starts at most every 10s). The loop writes nothing to the terminal (it would write over the console): an `open` error (e.g. application not found) goes back to the container in `<file>.error`, and `mac-editor` shows it. With several attached terminals, the `mv` of the request makes only one of them open the file.
+- **End of editing = Enter in the terminal**, not the application closing: `open -a` returns immediately, and most applications stay open after closing the document. It works with any application; `d` + Enter discards the changes, without rewriting the original file. Ctrl-C must not be used: it would also reach mitmproxy, which is in the same foreground process group.
+- **Without an attached `./mitm open`/`attach`** (e.g. `container exec … tmux attach` by hand) nobody takes the request within 3s: `mac-editor` says to open `edit/<file>` by hand, and the rest is the same.
+- **Files replaced on the Mac invisible for ~1s**: many editors save atomically (new file + rename); through the volume, the container keeps seeing the old entry, already removed (`No such file or directory`) until the directory is listed again or ~1s has passed. Writes in place, and files written by the container, are visible immediately on the other side. `mac-editor` lists `/edit` before reading the file back, and retries for 5s; the copy into mitmproxy's file goes through a temporary file, so that a failed read does not empty the original.
+- **Viewer** (read-only file, with the extension of the content type): opened with the default application for the type (`open`, or `open -t` if no application handles it), not with `MITM_EDITOR`; Enter returns to mitmproxy without reading anything back.
+- The copies in `./edit` are removed after Enter, and at every container start; the `.open`/`.error` files never contain flow data. The directory is ignored by git.
+
 After a Mac reboot the `container` services do not restart on their own (`apiserver is not running and not registered with launchd`): the `com.mitm.dhcp` LaunchAgent (section 9) starts them at login, together with DHCP. mitmproxy is restarted by hand with `./mitm start`.
 
 #### Web UI from the Mac (`MITM_UI=web`): `http://mitmproxy.test:8081`
@@ -248,6 +270,7 @@ Notes:
 - A dedicated directory prevents the container from loading the `~/.mitmproxy/config.yaml` used on the Mac (with its `ignore_hosts`, `ssl_insecure`, …). A `config.yaml` in `./mitmproxy`, if present, is loaded: command-line options (`mode`, `listen_port`, `web_port`, …) take precedence, everything else is applied. To avoid having two different values for the same option, those set by `entrypoint.sh` must not be repeated in `config.yaml`.
 - `--volume ./export:/export`: mitmproxy's working directory, to get on the Mac the files saved by its commands, for example `:save.file @shown flows.mitm` (or `w`), `:export.file curl @focus request.sh`, `:cut.save @focus response.content body.bin`. Relative paths end up in `./export`; absolute ones (e.g. `/tmp/x`) stay in the container. Like `./mitmproxy`, the directory must exist: `./mitm start` creates it. The files appear on the Mac owned by the current user. It is ignored by git.
   A project folder is mounted rather than the Desktop: `~/Desktop` is protected by TCC (the access would be made by `container`'s virtualization process, and on a managed Mac the authorization may be denied by policy), and there is no need to give a root process that handles untrusted traffic write access to the whole Desktop. To keep it at hand: `ln -s "$PWD/export" ~/Desktop/mitm-export`.
+- `--volume ./edit:/edit`: files being edited on the Mac (section 7, *Editing on the Mac*). It must exist too: `./mitm start` creates it.
 - `MITM_WEB_PASSWORD` in clear text is visible in `container inspect mitmproxy.test` and in the container's process list. To avoid this, `web_password` also accepts an argon2 hash (mitmweb itself suggests it at startup).
 
 ### 8. Stopping (`./mitm stop`)

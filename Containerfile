@@ -15,6 +15,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir "mitmproxy==12.2.3"
 
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY mac-editor.sh /usr/local/bin/mac-editor
+RUN chmod +x /entrypoint.sh /usr/local/bin/mac-editor
+
+# Console: editing (e) and external viewer (v) with an application on the
+# Mac, through ./edit (see mac-editor.sh)
+ENV MITMPROXY_EDITOR=/usr/local/bin/mac-editor
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
