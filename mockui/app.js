@@ -7,6 +7,9 @@
 let state = { enabled: false, mocks: [], hits: {}, methods: [], no_body_status: [] };
 let editing = null;   // id of the mock being edited, or "new"
 let pendingFile = null;  // file chosen but not yet uploaded (saved first)
+let copied = null;    // new mock prefilled from a real request, or null
+let copiedNote = "";  // what could not be copied from it (binary content, ...)
+let flows = null;     // requests offered by the picker, null = not read yet
 
 const $ = (id) => document.getElementById(id);
 
@@ -44,6 +47,17 @@ async function api(path, options = {}) {
   state = await response.json();
   render();
   return state;
+}
+
+// Requests of the history: unlike the mocks, these are not the state of the
+// dashboard, so they do not go through api()
+async function fetchJson(path) {
+  const response = await fetch(path);
+  if (!response.ok) {
+    showError(`${response.status} ${response.statusText}`);
+    throw new Error(response.statusText);
+  }
+  return response.json();
 }
 
 // --- global switch ---------------------------------------------------------
@@ -146,15 +160,21 @@ const EMPTY = {
   body_file: "", body_filename: "",
 };
 
-function openEditor(id) {
+function openEditor(id, prefill = null, note = "") {
   editing = id;
   pendingFile = null;
+  // Missing fields (a mock copied from a request has no body_file) come from
+  // EMPTY: renderEditor() reads them all
+  copied = prefill ? { ...EMPTY, ...prefill } : null;
+  copiedNote = prefill ? note : "";
   render();
 }
 
 function closeEditor() {
   editing = null;
   pendingFile = null;
+  copied = null;
+  copiedNote = "";
   render();
 }
 
@@ -186,7 +206,7 @@ function renderEditor() {
   if (editing === null) return;
 
   const draft = editing === "new"
-    ? { ...EMPTY }
+    ? copied || { ...EMPTY }
     : state.mocks.find((m) => m.id === editing);
   if (!draft) return closeEditor();
 
@@ -297,9 +317,13 @@ function renderEditor() {
 
   const editor = el("div", {}, [
     el("div", { className: "pane-head" }, [
-      el("h2", { textContent: editing === "new" ? "New mock" : "Edit mock" }),
+      el("h2", {
+        textContent: editing !== "new" ? "Edit mock"
+          : copied ? "New mock from a request" : "New mock",
+      }),
       el("div", { className: "form-actions" }, [saveBtn, cancelBtn]),
     ]),
+    copiedNote ? el("p", { className: "note warn", textContent: copiedNote }) : null,
 
     field("Name", name),
 
@@ -326,6 +350,131 @@ function renderEditor() {
   pane.append(editor);
   refreshBody();
 }
+
+// --- picker: a new mock copied from a real request -------------------------
+//
+// The requests come from mitmproxy's history, which only the addon can see:
+// the dashboard asks it through /api/history (see server.py). Choosing one
+// fills the form of a new mock, which is saved like any other.
+
+const sizeText = (bytes) =>
+  bytes === null ? "" : bytes < 1024 ? `${bytes} B` : `${Math.round(bytes / 1024)} KB`;
+
+function flowRow(flow) {
+  const about = [flow.content_type, sizeText(flow.size)].filter(Boolean).join("  ·  ");
+  const row = el("div", { className: "flow" }, [
+    el("div", { className: "flow-top" }, [
+      el("span", { className: "badge", textContent: flow.method }),
+      el("span", {
+        className: `badge status-${String(flow.status)[0]}`,
+        textContent: flow.status === null ? "—" : flow.status,
+        title: flow.status === null ? "No response" : "",
+      }),
+      el("span", { className: "flow-host", textContent: flow.host }),
+      el("span", { className: "muted", textContent: flow.time }),
+    ]),
+    el("div", { className: "flow-path", textContent: flow.path }),
+    about ? el("div", { className: "flow-note", textContent: about }) : null,
+  ]);
+  row.onclick = () => pick(flow.id);
+  return row;
+}
+
+function renderPicker() {
+  const list = $("picker-list");
+  list.textContent = "";
+  if (flows === null) {
+    $("picker-count").textContent = "";
+    list.append(el("p", { className: "note", textContent: "Reading mitmproxy's history…" }));
+    return;
+  }
+  const needle = $("picker-filter").value.trim().toLowerCase();
+  const shown = flows.filter((f) =>
+    `${f.method} ${f.host}${f.path}`.toLowerCase().includes(needle));
+  $("picker-count").textContent = flows.length ? `— ${shown.length} of ${flows.length}` : "";
+  if (!shown.length) {
+    list.append(el("p", {
+      className: "note",
+      textContent: flows.length
+        ? "No request matches the filter."
+        : "Nothing in the history: the traffic has to pass through mitmproxy first.",
+    }));
+    return;
+  }
+  shown.forEach((flow) => list.append(flowRow(flow)));
+}
+
+async function loadHistory() {
+  flows = null;
+  renderPicker();
+  try {
+    flows = (await fetchJson("/api/history")).flows;
+  } catch {
+    flows = [];
+  }
+  renderPicker();
+}
+
+function openPicker() {
+  $("picker").hidden = false;
+  $("picker-filter").value = "";
+  $("picker-filter").focus();
+  loadHistory();
+}
+
+const closePicker = () => { $("picker").hidden = true; };
+
+async function pick(id) {
+  let answer;
+  try {
+    answer = await fetchJson(`/api/history/${id}`);
+  } catch {
+    return;  // gone from the history, or mitmproxy not answering
+  }
+  closePicker();
+  openEditor("new", answer.mock, answer.note);
+  if (!answer.download) return;
+  // Content left out of the form (binary, or too big). alert() blocks until
+  // it is closed: the download starts right after, as the message says.
+  alert(
+    `${answer.note}.\n\n` +
+    "The original response is downloaded as a file: to use it as the content " +
+    'of the mock, choose "File" under Content and upload it.'
+  );
+  downloadBody(id);
+}
+
+// The file does not go through <a href>: this way an error (the flow gone
+// from the history in the meantime, mitmproxy restarted) is shown like the
+// others instead of becoming a failed download.
+async function downloadBody(id) {
+  let response;
+  try {
+    response = await fetch(`/api/history/${id}/body`);
+  } catch {
+    return showError("Download of the response failed");
+  }
+  if (!response.ok) return showError(`${response.status} ${response.statusText}`);
+
+  const disposition = response.headers.get("content-disposition") || "";
+  const link = el("a", {
+    href: URL.createObjectURL(await response.blob()),
+    download: (disposition.match(/filename="([^"]*)"/) || [])[1] || "response",
+  });
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 60000);
+}
+
+$("from-btn").onclick = openPicker;
+$("picker-close").onclick = closePicker;
+$("picker-refresh").onclick = loadHistory;
+$("picker-filter").oninput = renderPicker;
+$("picker").onclick = (event) => { if (event.target.id === "picker") closePicker(); };
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !$("picker").hidden) closePicker();
+});
 
 // --- loop ------------------------------------------------------------------
 

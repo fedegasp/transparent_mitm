@@ -53,6 +53,10 @@ No command needs sudo, except `install`/`uninstall`. DHCP starts by itself at lo
 
 A mock replaces the response to the requests that match it: the request never reaches the server. Each one matches on a set of HTTP methods (none = any), the host, the path and key/value pairs to look for in the query string — host and path accept a trailing `*` as a wildcard, and the host also a leading `*.`; empty means any. The answer is any status code, with a content written in the form or uploaded as a file (for 204 and 304 there is no content). When several mocks match, the first one from the top of the list wins.
 
+A mock can also be **copied from a real request**: `From a request` lists the requests of mitmproxy's current history and fills the form with the one chosen — method, host and path (without the query string), and the real response: status, `Content-Type`, headers and content. Nothing is saved until `✓`.
+
+The content is copied only if it is text and under 512 KB. Otherwise an alert says why (binary content, or too big) and, when it is closed, **the original response is downloaded as a file**: it is then uploaded as the content of the mock with `Content` → `File`.
+
 They are managed from a web dashboard, `http://mitmproxy.test:8082`, opened with `./mitm mock` or with `M` in the console. The dashboard is up for as long as the container is, whatever interface mitmproxy uses — but **the mocks always start disabled**: after every `./mitm start` the switch at the top of the page has to be turned on again, otherwise the traffic passes normally. `./mitm status` reports it.
 
 It is reachable **only from the Mac**: LAN clients can reach the container, and get a `403`.

@@ -4,11 +4,16 @@ mitmproxy addon: mocks
 Serves the mocks defined from the dashboard (``mockui/server.py``, reachable
 at http://mitmproxy.test:8082) in place of the real response.
 
-The two processes never talk to each other: they share the ``/mocks`` volume
-(``./mocks`` on the Mac), and every file has a single writer.
+The two processes share the ``/mocks`` volume (``./mocks`` on the Mac), and
+every file has a single writer.
 
     dashboard  ──writes──▶  enabled, mocks.json, files/  ──read──▶  this addon
     this addon ──writes──▶  hits.json                    ──read──▶  dashboard
+
+The one thing the dashboard cannot see on its own is the flow history, which
+lives in mitmproxy's memory: it asks for it by writing ``ask/<token>.req``,
+and this addon answers in ``ask/<token>.res`` (the same request/answer channel
+``mac-editor.sh`` uses towards the Mac; each file still has a single writer).
 
 ``enabled`` is an empty file whose mere existence means "mocks active"; the
 dashboard removes it when it starts, so after every container start the mocks
@@ -32,11 +37,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
+import re
 import time
 from pathlib import Path
 from typing import Any
 
-from mitmproxy import command, http
+from mitmproxy import command, ctx, http
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -63,6 +70,36 @@ NO_BODY_STATUS = {204, 304}
 # Hits are counted in memory and written at most once every HITS_INTERVAL
 # seconds: one file write per request would be pointless I/O
 HITS_INTERVAL = 2.0
+
+# Requests of the dashboard for the flow history (see the header): it writes
+# <token>.req here, this addon answers in <token>.res and removes the request.
+ASK_DIR = MOCKS_DIR / "ask"
+ASK_INTERVAL = 0.3    # polling: one listing of a directory that is almost always empty
+ASK_TTL = 60.0        # answers nobody read (dashboard reloaded, browser closed)
+
+# Flows offered to the picker, newest first. The response content is copied
+# into the form only if it is text and not too big: a mock with a truncated
+# body would be worse than one to fill in by hand. What is left out can be
+# downloaded as a file (<token>.body, written next to the answer).
+HISTORY_MAX = 200
+HISTORY_BODY_MAX = 512 * 1024
+
+# Content types copied into the form as text; the others are offered as a
+# file. The bytes are not enough to decide: mitmproxy decodes a PNG into text
+# without complaining (it falls back to an encoding that never fails).
+TEXT_TYPES = (
+    "text/", "application/json", "application/xml", "application/javascript",
+    "application/ecmascript", "application/x-www-form-urlencoded",
+)
+
+# Response headers not copied into the mock: those that describe the body
+# (rebuilt by Response.make from the mock's own content), the hop-by-hop ones
+# and those that only add noise. Content-Type has its own field in the form.
+SKIP_HEADERS = {
+    "content-type", "content-length", "content-encoding", "transfer-encoding",
+    "connection", "keep-alive", "upgrade", "trailer", "te", "proxy-connection",
+    "proxy-authenticate", "date", "server", "alt-svc",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +132,101 @@ def matches(mock: dict[str, Any], request: http.Request) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# History: a real flow turned into the form of a new mock
+# ---------------------------------------------------------------------------
+
+def summary(flow: http.HTTPFlow) -> dict[str, Any]:
+    """One line of the picker."""
+    response = flow.response
+    content = response.raw_content if response else None
+    return {
+        "id": flow.id,
+        "time": time.strftime("%H:%M:%S", time.localtime(flow.request.timestamp_start)),
+        "method": flow.request.method,
+        "host": flow.request.pretty_host,
+        "path": flow.request.path,
+        "status": response.status_code if response else None,
+        "content_type": response.headers.get("content-type", "").split(";")[0] if response else "",
+        "size": len(content) if content is not None else None,
+    }
+
+
+def size_text(count: int) -> str:
+    return f"{count} B" if count < 1024 else f"{count / 1024:.0f} KB"
+
+
+def is_text(content_type: str) -> bool:
+    """Empty Content-Type: left to the strict decoding of response_body."""
+    kind = content_type.split(";")[0].strip().lower()
+    return not kind or kind.startswith(TEXT_TYPES) or kind.endswith(("+json", "+xml"))
+
+
+def response_body(response: http.Response) -> tuple[str, str, bool]:
+    """Content of the response as text for the form, why it is missing, and
+    whether it can at least be downloaded as a file."""
+    content = response.get_content(strict=False)
+    if content is None:
+        return "", "Streamed response: the content was not kept", False
+    if not content:
+        return "", "", False
+    kind = response.headers.get("content-type", "")
+    size = size_text(len(content))
+    if len(content) > HISTORY_BODY_MAX:
+        return "", f"Content of {size}: not copied into the form (limit {HISTORY_BODY_MAX // 1024} KB)", True
+    if not is_text(kind):
+        return "", f"Binary content ({kind.split(';')[0]}, {size}): not copied into the form", True
+    try:
+        return response.get_text(strict=True) or "", "", False
+    except ValueError:
+        return "", f"Content of {size} not decodable: not copied into the form", True
+
+
+def download_name(flow: http.HTTPFlow) -> str:
+    """The URL of the request as a file name, for the downloaded content."""
+    url = f"{flow.request.pretty_host}{flow.request.path.split('?', 1)[0]}"
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", url).strip("-.")[:80] or "response"
+    kind = (flow.response.headers.get("content-type", "") if flow.response else "")
+    suffix = mimetypes.guess_extension(kind.split(";")[0].strip()) or ""
+    return name if name.endswith(suffix) else name + suffix
+
+
+def prefill(flow: http.HTTPFlow) -> dict[str, Any]:
+    """Fields of a new mock that reproduces this flow, and a note for the UI.
+
+    The match is the request without its query string (every parameter of a
+    real URL as a condition would make the mock match almost nothing); the
+    response is the real one, which is what there is to edit.
+    """
+    request = flow.request
+    path = request.path.split("?", 1)[0]
+    mock: dict[str, Any] = {
+        "name": f"{request.method} {request.pretty_host}{path}",
+        "enabled": True,
+        "methods": [request.method.upper()],
+        "host": request.pretty_host.lower(),
+        "path": path,
+        "query": [],
+        "status": 200,
+        "content_type": "",
+        "headers": [],
+        "body_mode": "text",
+        "body": "",
+    }
+    if flow.response:
+        mock["status"] = flow.response.status_code
+        mock["content_type"] = flow.response.headers.get("content-type", "")
+        mock["headers"] = [
+            {"key": key, "value": value}
+            for key, value in flow.response.headers.items(multi=True)
+            if key.lower() not in SKIP_HEADERS
+        ]
+        mock["body"], note, download = response_body(flow.response)
+    else:
+        note, download = "No response: only the request has been copied", False
+    return {"mock": mock, "note": note, "download": download}
+
+
+# ---------------------------------------------------------------------------
 # Addon
 # ---------------------------------------------------------------------------
 
@@ -104,6 +236,7 @@ class Mocks:
         self.mtime: float | None = None
         self.hits: dict[str, dict[str, Any]] = self._read_hits()
         self.flush_scheduled = False
+        self.polling = False
 
     # --- mocks.json, reloaded when it changes -----------------------------
 
@@ -209,9 +342,107 @@ class Mocks:
                 self.respond(mock, flow)
                 return
 
+    def running(self) -> None:
+        if not self.polling:
+            self.polling = True
+            self.poll_ask()
+
     def done(self) -> None:
+        # Also called on the old instance when the addon is reloaded: without
+        # this, two pollers would race for the same requests
+        self.polling = False
         if self.flush_scheduled:
             self.flush_hits()
+
+    # --- requests of the dashboard ----------------------------------------
+
+    def poll_ask(self) -> None:
+        """Answer the dashboard's requests (see the header).
+
+        Polling, and not a socket: a socket in the addon would have to be
+        released and reopened at every hot reload. One listing of an almost
+        always empty directory every ASK_INTERVAL costs nothing.
+        """
+        if not self.polling:
+            return
+        now = time.time()
+        try:
+            ASK_DIR.mkdir(exist_ok=True)
+            entries = list(ASK_DIR.iterdir())
+        except OSError as exc:
+            logging.warning(f"[mocks] {ASK_DIR} unusable: {exc}")
+            entries = []
+        for path in entries:
+            try:
+                if path.suffix == ".req":
+                    self.answer(path)
+                elif now - path.stat().st_mtime > ASK_TTL:
+                    path.unlink(missing_ok=True)
+            except OSError as exc:
+                logging.warning(f"[mocks] {path.name}: {exc}")
+        asyncio.get_running_loop().call_later(ASK_INTERVAL, self.poll_ask)
+
+    def answer(self, path: Path) -> None:
+        """Read a request, remove it and write the answer next to it."""
+        try:
+            ask = json.loads(path.read_text())
+        except (OSError, ValueError):
+            ask = {}
+        path.unlink(missing_ok=True)
+        try:
+            data = self.handle(ask if isinstance(ask, dict) else {}, path.stem)
+        except Exception as exc:  # the dashboard must get an answer anyway
+            logging.warning(f"[mocks] request {ask}: {exc}")
+            data = {"error": str(exc)}
+        result = path.with_suffix(".res")
+        tmp = result.with_name(f".{result.name}.tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(result)
+
+    def handle(self, ask: dict[str, Any], token: str) -> dict[str, Any]:
+        what = ask.get("what")
+        if what == "list":
+            return {"flows": [summary(flow) for flow in self.flows()[:HISTORY_MAX]]}
+        if what in ("flow", "body"):
+            flow = next((f for f in self.flows() if f.id == ask.get("id")), None)
+            if flow is None:
+                return {"error": "the request is no longer in the history"}
+            return prefill(flow) if what == "flow" else self.save_body(flow, token)
+        return {"error": f"unknown request '{what}'"}
+
+    @staticmethod
+    def save_body(flow: http.HTTPFlow, token: str) -> dict[str, Any]:
+        """Write the content of the response next to the answer, for the
+        dashboard to hand it to the browser and remove it.
+
+        The content, not the bytes on the wire: a gzipped file would be of no
+        use. It is not passed inside the answer (base64 of a few MB for every
+        video), and it is not kept: what is downloaded is a copy of what is in
+        mitmproxy's memory at that moment.
+        """
+        content = flow.response.get_content(strict=False) if flow.response else None
+        if not content:
+            return {"error": "this response has no content"}
+        file = ASK_DIR / f"{token}.body"
+        tmp = file.with_name(f".{file.name}.tmp")
+        tmp.write_bytes(content)
+        tmp.replace(file)
+        return {"file": file.name, "name": download_name(flow), "size": len(content)}
+
+    @staticmethod
+    def flows() -> list[http.HTTPFlow]:
+        """HTTP flows of the current history, newest first.
+
+        The source is mitmproxy's view addon, i.e. exactly what the console or
+        the web UI is showing, filter included. Its order depends on the
+        options (view_order, view_order_reversed): the picker sorts by itself.
+        """
+        view = ctx.master.addons.get("view")
+        if view is None:
+            raise RuntimeError("history not available (no view addon)")
+        flows = [flow for flow in view if isinstance(flow, http.HTTPFlow)]
+        flows.sort(key=lambda flow: flow.request.timestamp_start, reverse=True)
+        return flows
 
     # --- command -----------------------------------------------------------
 

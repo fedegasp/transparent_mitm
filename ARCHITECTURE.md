@@ -391,7 +391,7 @@ Usage: [README.md](README.md#mocks). A mock replaces the response to the request
 
 Mockoon, WireMock and the like are mock servers to be reached at their own address. In transparent mode the clients' traffic cannot be diverted to them without **rewriting the destination**, which is exactly what this architecture avoids (`route-to` and not `rdr`, so that mitmproxy can recover the original address with `SO_ORIGINAL_DST`: section 2). The fake response therefore has to be injected into the flow by mitmproxy, i.e. by an addon. [`woltapp/mitmproxy-mock`](https://github.com/woltapp/mitmproxy-mock) does the same thing but is configured only by hand in JSON; a dashboard for the mocks is still an open request on mitmproxy's own web UI ([#7878](https://github.com/mitmproxy/mitmproxy/issues/7878)).
 
-#### Two processes, one direction
+#### Two processes, one direction (almost)
 
 The dashboard is a **separate process** in the same container, started by `entrypoint.sh`, not code inside the addon: this way the hot reload of the addons never has to release and reopen a socket, and an error in the dashboard does not touch the proxy. It uses `tornado`, already in the image as a dependency of mitmproxy (it is what mitmweb runs on), so **no new package** — the standard library is not enough, `cgi`, which parsed multipart uploads, was removed in Python 3.13.
 
@@ -409,6 +409,23 @@ browser on the Mac ──http://mitmproxy.test:8082──▶ mockui/server.py
 ```
 
 Every file has a **single writer** — `enabled` and `mocks.json` belong to the dashboard, `hits.json` to the addon — so there is no lock and no API between the two processes. Writes go through a temporary file and a rename, like the state files of `./mitm`: the reader never sees half a file. The addon rereads `mocks.json` when its mtime changes (one `stat` per request), so a change made from the dashboard, or by hand on the Mac, applies to the next request.
+
+#### Copying a mock from a real request (`/mocks/ask`)
+
+Usage: [README.md](README.md#mocks). The only thing the dashboard needs and cannot read from a file is the **flow history**, which lives in mitmproxy's memory. It asks the addon for it with the same request/answer pattern as `mac-editor.sh` towards the Mac, in `/mocks/ask`: each file still has a single writer.
+
+```
+browser ──GET /api/history[/<flow>]──▶ server.py ──writes──▶ ask/<token>.req
+                                           │ waits (4s max)        │ reads (every 0.3s)
+                                           ◀──reads── ask/<token>.res ◀──writes── scripts/mocks.py
+                                                                            (mitmproxy's view addon)
+```
+
+- **Polling and not a socket**, for the same reason the dashboard is a separate process: a socket in the addon would have to be released and reopened at every hot reload. One listing of an almost always empty directory every 0.3s costs nothing; the exchange takes ~0.3s, the dashboard gives up after 4s (mitmproxy restarting, or the addon not loaded) and says so.
+- **The source is the `view` addon**, i.e. exactly the flows the console or the web UI is showing, filter included — not a second copy recorded by the addon. Nothing is written to disk to keep a history.
+- **The chosen request only fills the form**: the mock is created by the usual save, and `clean_mock` rebuilds it field by field as for any other. The match is method, host and path **without the query string** (every parameter of a real URL as a condition would make the mock match almost nothing); the response is the real one: status, `Content-Type`, the headers that are not rebuilt by `Response.make` (not `Content-Length`, `Content-Encoding`, hop-by-hop, `Date`, `Server`…) and the content.
+- **Content only if it is text** and under 512 KB: a mock with a truncated body would be worse than one to fill in by hand. Text is decided by the `Content-Type`, not by the bytes: mitmproxy decodes a PNG into text without complaining (it falls back to an encoding that never fails).
+- **What is left out is downloaded**: the dashboard shows an alert saying why, and when it is closed it downloads the real response (`/api/history/<flow>/body`), to be uploaded as the content of the mock. The addon writes the content next to its answer (`ask/<token>.body`) and the dashboard hands it to the browser and removes it: not inside the JSON answer (base64 of a few MB for every video), and nothing is kept on disk. What is written is the content, not the bytes on the wire — a gzipped file would be of no use.
 
 #### The switch is not persisted
 

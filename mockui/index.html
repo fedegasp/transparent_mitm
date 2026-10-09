@@ -22,7 +22,10 @@
   <section class="pane">
     <div class="pane-head">
       <h2>Mocks <span id="count" class="muted"></span></h2>
-      <button id="new-btn" type="button" class="primary">+ New mock</button>
+      <div class="form-actions">
+        <button id="from-btn" type="button">From a request</button>
+        <button id="new-btn" type="button" class="primary">+ New mock</button>
+      </div>
     </div>
     <p class="note">The first enabled mock that matches wins, from the top down.</p>
     <div id="list"></div>
@@ -32,6 +35,21 @@
     <div id="editor"></div>
   </section>
 </main>
+
+<div id="picker" class="overlay" hidden>
+  <section class="pane picker">
+    <div class="pane-head">
+      <h2>Requests <span id="picker-count" class="muted"></span></h2>
+      <div class="form-actions">
+        <button id="picker-refresh" type="button" title="Reload the list" aria-label="Reload">⟳</button>
+        <button id="picker-close" type="button" title="Close" aria-label="Close">✕</button>
+      </div>
+    </div>
+    <p class="note">mitmproxy's current history. The chosen request fills the form of a new mock: nothing is saved until you press ✓.</p>
+    <input id="picker-filter" type="text" placeholder="Filter: method, host, path">
+    <div id="picker-list"></div>
+  </section>
+</div>
 
 <p id="error" class="error" hidden></p>
 

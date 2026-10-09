@@ -11,11 +11,16 @@ Plain HTTP on purpose: see HISTORY, item 19. TLS with a certificate issued by
 mitmproxy's own CA was tried and reverted — Digital Guardian re-signs the
 browser's connections, so the browser never sees that certificate.
 
-The two processes never talk to each other: they share the ``/mocks`` volume
-(``./mocks`` on the Mac), and every file has a single writer.
+The two processes share the ``/mocks`` volume (``./mocks`` on the Mac), and
+every file has a single writer.
 
     dashboard  ──writes──▶  enabled, mocks.json, files/  ──read──▶  addon
     addon      ──writes──▶  hits.json                    ──read──▶  dashboard
+
+A new mock can also be copied from a real request. The flows live in
+mitmproxy's memory, so the dashboard asks the addon for them by writing
+``ask/<token>.req`` and waiting for the ``ask/<token>.res`` it writes back
+(``/api/history``); the addon polls that directory.
 
 ``enabled`` is an empty file whose mere existence means "mocks active". It is
 **removed at startup**: after every container start the mocks are off until the
@@ -40,6 +45,7 @@ import json
 import mimetypes
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -55,6 +61,12 @@ FILES_DIR = MOCKS_DIR / "files"
 MOCKS_FILE = MOCKS_DIR / "mocks.json"
 HITS_FILE = MOCKS_DIR / "hits.json"
 ENABLED_FILE = MOCKS_DIR / "enabled"
+ASK_DIR = MOCKS_DIR / "ask"
+
+# The addon polls ASK_DIR every 0.3s: a couple of seconds are enough, unless
+# mitmproxy is restarting (console: q) or the addon failed to load
+ASK_TIMEOUT = 4.0
+ASK_POLL = 0.05
 
 STATIC_DIR = Path(__file__).resolve().parent
 PORT = int(os.environ.get("MOCK_UI_PORT", "8082"))
@@ -90,6 +102,45 @@ def _write_atomic(path: Path, data: bytes) -> None:
     tmp = path.with_name(f".{path.name}.tmp")
     tmp.write_bytes(data)
     os.replace(tmp, path)
+
+
+async def ask_addon(what: str, **fields: Any) -> dict[str, Any]:
+    """Ask the mitmproxy addon something only it can see: the flow history.
+
+    Request and answer are two files, each with a single writer, as everything
+    else here. The token keeps the answers of several browsers apart.
+    """
+    token = uuid.uuid4().hex
+    ASK_DIR.mkdir(parents=True, exist_ok=True)
+    request = ASK_DIR / f"{token}.req"
+    answer = ASK_DIR / f"{token}.res"
+    _write_atomic(request, json.dumps({"what": what, **fields}).encode())
+    try:
+        deadline = time.monotonic() + ASK_TIMEOUT
+        while time.monotonic() < deadline:
+            await asyncio.sleep(ASK_POLL)
+            if not answer.exists():
+                continue
+            try:
+                data = json.loads(answer.read_text())
+            except (OSError, ValueError):
+                raise tornado.web.HTTPError(502, reason="malformed answer from mitmproxy")
+            if not isinstance(data, dict):
+                raise tornado.web.HTTPError(502, reason="malformed answer from mitmproxy")
+            if data.get("error"):
+                raise tornado.web.HTTPError(502, reason=_reason(data["error"]))
+            return data
+        raise tornado.web.HTTPError(
+            504, reason="mitmproxy is not answering: is it running?"
+        )
+    finally:
+        request.unlink(missing_ok=True)
+        answer.unlink(missing_ok=True)
+
+
+def _reason(message: str) -> str:
+    """HTTP reason phrase: one line, and short — the UI shows it as it is."""
+    return re.sub(r"[^\x20-\x7e]", " ", str(message))[:120] or "error"
 
 
 def load_mocks() -> list[dict[str, Any]]:
@@ -332,6 +383,53 @@ class BodyHandler(ApiHandler):
         self.write(path.read_bytes())
 
 
+class HistoryHandler(ApiHandler):
+    """Requests of the current history, to copy a mock from a real one."""
+
+    async def get(self) -> None:
+        self.write(await ask_addon("list"))
+
+
+class HistoryFlowHandler(ApiHandler):
+    """Fields of a new mock built from one of those requests.
+
+    Nothing is saved: the dashboard fills the form with them, and it is the
+    usual save that creates the mock (``clean_mock`` rebuilds it field by
+    field anyway, so these values are not trusted any more than the others).
+    """
+
+    async def get(self, flow_id: str) -> None:
+        answer = await ask_addon("flow", id=flow_id)
+        self.write({
+            "mock": answer.get("mock", {}),
+            "note": str(answer.get("note", "")),
+            # The content was left out of the form (binary, or too big): the
+            # dashboard offers it for download instead
+            "download": bool(answer.get("download")),
+        })
+
+
+class HistoryBodyHandler(ApiHandler):
+    """The real content of a response, downloaded as a file.
+
+    The addon writes it next to its answer (see ``save_body``); here it is
+    handed to the browser and removed — it is a copy, not a store.
+    """
+
+    async def get(self, flow_id: str) -> None:
+        answer = await ask_addon("body", id=flow_id)
+        name = _safe_filename(str(answer.get("name", "")))
+        file = (ASK_DIR / os.path.basename(str(answer.get("file", "")))).resolve()
+        if not file.is_relative_to(ASK_DIR.resolve()) or not file.is_file():
+            raise tornado.web.HTTPError(502, reason="content not received from mitmproxy")
+        try:
+            self.set_header("Content-Type", "application/octet-stream")
+            self.set_header("Content-Disposition", f'attachment; filename="{name}"')
+            self.write(file.read_bytes())
+        finally:
+            file.unlink(missing_ok=True)
+
+
 class EnabledHandler(ApiHandler):
     """Global switch. Not persisted: see the note at the top of the file."""
 
@@ -376,6 +474,9 @@ def make_app() -> tornado.web.Application:
             (r"/api/mocks/([0-9a-f]+)/move", MoveHandler),
             (r"/api/mocks/([0-9a-f]+)/body", BodyHandler),
             (r"/api/enabled", EnabledHandler),
+            (r"/api/history", HistoryHandler),
+            (r"/api/history/([0-9a-fA-F-]{8,64})", HistoryFlowHandler),
+            (r"/api/history/([0-9a-fA-F-]{8,64})/body", HistoryBodyHandler),
         ],
         # Uploaded contents can be large (a recorded response body)
         max_buffer_size=64 * 1024 * 1024,
@@ -384,6 +485,10 @@ def make_app() -> tornado.web.Application:
 
 async def main() -> None:
     FILES_DIR.mkdir(parents=True, exist_ok=True)
+    # Answers to requests of a previous run: nobody is waiting for them
+    ASK_DIR.mkdir(parents=True, exist_ok=True)
+    for leftover in ASK_DIR.iterdir():
+        leftover.unlink(missing_ok=True)
     # Mocks always start off, whatever the previous run left behind
     set_enabled(False)
     if not MOCKS_FILE.exists():
