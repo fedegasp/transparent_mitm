@@ -1,0 +1,154 @@
+:root {
+  --bg: #15181d;
+  --panel: #1d2128;
+  --panel-2: #252a33;
+  --line: #333a45;
+  --text: #dfe3ea;
+  --muted: #8b94a3;
+  --accent: #7aa2f7;
+  --on: #71c07a;
+  --off: #6b7384;
+  --warn: #e0af68;
+  --danger: #e06c75;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 0 1.5rem 3rem;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+
+h1 { font-size: 1.15rem; margin: 0; }
+h2 { font-size: 0.95rem; margin: 0; }
+h3 { font-size: 0.85rem; margin: 1.2rem 0 0.4rem; color: var(--muted);
+     text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+
+.muted { color: var(--muted); font-weight: 400; }
+.note { color: var(--muted); font-size: 0.8rem; margin: 0.3rem 0 0; }
+
+/* --- header + global switch --------------------------------------------- */
+
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 1.5rem; flex-wrap: wrap;
+  padding: 1.2rem 0; border-bottom: 1px solid var(--line); margin-bottom: 1.2rem;
+}
+
+.switch { text-align: right; }
+
+#switch-btn {
+  display: inline-flex; align-items: center; gap: 0.55rem;
+  padding: 0.5rem 0.9rem; border: 1px solid var(--line); border-radius: 999px;
+  background: var(--panel); color: var(--text); font-size: 0.9rem; font-weight: 600;
+  cursor: pointer;
+}
+#switch-btn:hover { border-color: var(--muted); }
+#switch-btn .dot {
+  width: 10px; height: 10px; border-radius: 50%; background: var(--off);
+}
+#switch-btn[aria-pressed="true"] { border-color: var(--on); color: var(--on); }
+#switch-btn[aria-pressed="true"] .dot { background: var(--on); box-shadow: 0 0 8px var(--on); }
+
+/* --- layout -------------------------------------------------------------- */
+
+main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.5rem; }
+@media (max-width: 1000px) { main { grid-template-columns: minmax(0, 1fr); } }
+
+.pane { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 1rem 1.1rem 1.2rem; }
+.pane-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+
+/* --- mock list ----------------------------------------------------------- */
+
+#list { margin-top: 0.9rem; display: flex; flex-direction: column; gap: 0.6rem; }
+#list:empty::after { content: "No mocks. Create une using « + New mock »."; color: var(--muted); }
+
+.mock {
+  border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2);
+  padding: 0.7rem 0.8rem; display: grid; gap: 0.45rem; cursor: pointer;
+}
+.mock:hover { border-color: var(--muted); }
+.mock .check, .mock-actions { cursor: auto; }
+.mock.selected { border-color: var(--accent); }
+.mock.disabled .mock-title, .mock.disabled .mock-match { opacity: 0.45; }
+
+.mock-top { display: flex; align-items: center; gap: 0.6rem; }
+.mock-title { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mock-match { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; color: var(--muted); word-break: break-all; }
+.mock-actions { display: flex; gap: 0.3rem; }
+
+.badge {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem;
+  padding: 0.1rem 0.4rem; border-radius: 3px; background: #2f3744; color: var(--text);
+}
+.badge.status-2 { color: var(--on); }
+.badge.status-3 { color: var(--accent); }
+.badge.status-4, .badge.status-5 { color: var(--danger); }
+.badge.hits { color: var(--warn); }
+
+/* --- form ---------------------------------------------------------------- */
+
+label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 0.2rem; }
+
+input[type=text], input[type=number], textarea, select {
+  width: 100%; padding: 0.4rem 0.5rem; background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); border-radius: 4px; font: inherit;
+}
+input[type=text], input[type=number], textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; }
+input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
+textarea { min-height: 9rem; resize: vertical; }
+
+.field { margin-bottom: 0.7rem; }
+.row { display: flex; gap: 0.6rem; }
+.row > * { flex: 1; }
+
+.methods { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.methods label {
+  margin: 0; padding: 0.25rem 0.5rem; border: 1px solid var(--line); border-radius: 4px;
+  cursor: pointer; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem; color: var(--text); background: var(--bg);
+}
+.methods label:has(input:checked) { border-color: var(--accent); color: var(--accent); }
+.methods input { display: none; }
+
+.pairs { display: flex; flex-direction: column; gap: 0.35rem; }
+.pair { display: flex; gap: 0.35rem; align-items: center; }
+.pair input { flex: 1; }
+/* + (add row) and × (remove row): same width, so the rows stay aligned */
+.pair-field button.icon { min-width: 1.8rem; font-size: 0.95rem; line-height: 1; }
+.pair-field > button.icon { margin-top: 0.35rem; }
+
+fieldset { border: 1px solid var(--line); border-radius: 5px; padding: 0.7rem; margin: 0 0 0.7rem; }
+fieldset[disabled] { opacity: 0.45; }
+legend { font-size: 0.78rem; color: var(--muted); padding: 0 0.3rem; }
+
+.radios { display: flex; gap: 1rem; margin-bottom: 0.6rem; }
+.radios label { display: flex; align-items: center; gap: 0.35rem; margin: 0; color: var(--text); font-size: 0.85rem; cursor: pointer; }
+
+.check { display: flex; align-items: center; gap: 0.4rem; color: var(--text); font-size: 0.85rem; cursor: pointer; margin: 0; }
+
+/* Save and Cancel: icons on the right of the form header */
+.form-actions { display: flex; gap: 0.4rem; }
+.form-actions button { font-size: 1rem; line-height: 1; padding: 0.3rem 0.7rem; }
+#editor .pane-head { padding-bottom: 0.9rem; margin-bottom: 0.2rem; border-bottom: 1px solid var(--line); }
+
+/* --- buttons ------------------------------------------------------------- */
+
+button {
+  padding: 0.35rem 0.65rem; border: 1px solid var(--line); border-radius: 4px;
+  background: var(--panel-2); color: var(--text); font: inherit; font-size: 0.82rem; cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--muted); }
+button:disabled { opacity: 0.35; cursor: default; }
+button.primary { border-color: var(--accent); color: var(--accent); }
+button.danger:hover { border-color: var(--danger); color: var(--danger); }
+button.icon { padding: 0.2rem 0.45rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+.error {
+  position: fixed; left: 50%; bottom: 1.5rem; transform: translateX(-50%);
+  background: var(--danger); color: #1b1d21; padding: 0.5rem 1rem; border-radius: 5px;
+  font-weight: 600; max-width: 80vw;
+}

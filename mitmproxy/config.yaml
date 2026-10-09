@@ -2,7 +2,7 @@ ssl_insecure: true
 view_order_reversed: true
 console_palette: lowdark
 scripts:
-  - ~/.mitmproxy/scripts/send_response.py
+  - ~/.mitmproxy/scripts/mocks.py
   - ~/.mitmproxy/scripts/export_files.py
   - ~/.mitmproxy/scripts/pin_marked.py
 body_size_limit: 30m

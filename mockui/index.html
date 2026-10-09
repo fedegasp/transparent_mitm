@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mock dashboard</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header>
+  <h1>Mock dashboard</h1>
+  <div id="switch" class="switch">
+    <button id="switch-btn" type="button" aria-pressed="false">
+      <span class="dot"></span><span id="switch-label">Mocks off</span>
+    </button>
+    <p id="switch-note" class="note"></p>
+  </div>
+</header>
+
+<main>
+  <section class="pane">
+    <div class="pane-head">
+      <h2>Mocks <span id="count" class="muted"></span></h2>
+      <button id="new-btn" type="button" class="primary">+ New mock</button>
+    </div>
+    <p class="note">The first enabled mock that matches wins, from the top down.</p>
+    <div id="list"></div>
+  </section>
+
+  <section class="pane" id="editor-pane" hidden>
+    <div id="editor"></div>
+  </section>
+</main>
+
+<p id="error" class="error" hidden></p>
+
+<script src="/app.js"></script>
+</body>
+</html>

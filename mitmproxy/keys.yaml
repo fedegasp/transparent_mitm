@@ -8,3 +8,7 @@
 - key: U
   ctx: ["flowlist", "flowview"]
   cmd: pin.unpin
+- key: M
+  ctx: ["flowlist", "flowview"]
+  cmd: mock.dashboard
+  help: Mock dashboard in the browser on the Mac

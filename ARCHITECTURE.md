@@ -133,6 +133,7 @@ A single command, [mitm](mitm), for start, stop and diagnostics:
 ./mitm status                  status of containers, pf rules, daemon and agents
 ./mitm open                    mitmproxy interface (web UI in the browser, or console)
 ./mitm attach                  mitmproxy console (tmux)
+./mitm mock                    mock dashboard in the browser (section 11)
 ./mitm logs [dhcp|pf] [-f]     logs of mitmproxy, dnsmasq or the pf daemon
 ./mitm build [proxy|dhcp]      build the images (default: both)
 ```
@@ -174,6 +175,7 @@ Critical points:
 - **`tini` as PID 1** (via `ENTRYPOINT`) and **mitmproxy/mitmweb in a `while` loop**: it is a child process that can be killed/restarted without stopping the container. Without the loop, when mitmweb exits the entrypoint terminates and the container with it.
 - **Console: two loops**. The one inside the `tmux` session restarts `mitmproxy` after an exit (`q`) without closing the session, so whoever is attached immediately sees the new instance. The outer one, in the entrypoint, recreates the session if it is closed (`tmux kill-session`) and keeps the container alive: `tmux new-session -d` returns immediately, and without the loop the entrypoint would terminate. In console mode `container logs mitmproxy.test` does not show mitmproxy's output (it is in the `tmux` session, events with `E`).
 - **Current directory `/export`** (volume `./export`, section 7): relative paths of commands that write to disk end up there.
+- **Mock dashboard started in the background** (`python3 /mockui/server.py`, supervised by a `while` loop like mitmproxy), before the two `MITM_UI` branches, so it runs in both: section 11. `MITM_VM_NET` is exported for it — the container network is already computed above for the `iptables` rule.
 - **`/edit` emptied at startup** (volume `./edit`, section 7): leftovers of edits interrupted by a container stop.
 - **`block_global=false`**: `block_global` blocks connections from **clients** with a public IP (it does not concern the destination). LAN clients `192.168.3.x` are private, so it is not strictly needed; it is kept to avoid surprises if a client shows up with a non-private IP.
 - **Web UI password** (only `MITM_UI=web`) **from an environment variable** (`MITM_WEB_PASSWORD`, passed with `container run -e`), not written into the image. `./mitm start` always passes it, defaulting to `password` if not set. If the variable were missing entirely (container started by hand), mitmweb generates a random token printed in the logs (`container logs mitmproxy.test`). The web UI is also reachable from LAN clients (the Mac forwards `192.168.3.0/24` → `192.168.64.0/24`): with the default password anyone on the LAN can access it.
@@ -271,6 +273,7 @@ Notes:
 - `--volume ./export:/export`: mitmproxy's working directory, to get on the Mac the files saved by its commands, for example `:save.file @shown flows.mitm` (or `w`), `:export.file curl @focus request.sh`, `:cut.save @focus response.content body.bin`. Relative paths end up in `./export`; absolute ones (e.g. `/tmp/x`) stay in the container. Like `./mitmproxy`, the directory must exist: `./mitm start` creates it. The files appear on the Mac owned by the current user. It is ignored by git.
   A project folder is mounted rather than the Desktop: `~/Desktop` is protected by TCC (the access would be made by `container`'s virtualization process, and on a managed Mac the authorization may be denied by policy), and there is no need to give a root process that handles untrusted traffic write access to the whole Desktop. To keep it at hand: `ln -s "$PWD/export" ~/Desktop/mitm-export`.
 - `--volume ./edit:/edit`: files being edited on the Mac (section 7, *Editing on the Mac*). It must exist too: `./mitm start` creates it.
+- `--volume ./mocks:/mocks` and `--volume ./mockui:/mockui`: mock definitions and uploaded contents, and the dashboard that manages them (section 11). `./mocks` is created by `./mitm start` and ignored by git; `./mockui` is code, and is mounted instead of being copied into the image so it can be changed without a rebuild.
 - `MITM_WEB_PASSWORD` in clear text is visible in `container inspect mitmproxy.test` and in the container's process list. To avoid this, `web_password` also accepts an argon2 hash (mitmweb itself suggests it at startup).
 
 ### 8. Stopping (`./mitm stop`)
@@ -380,6 +383,51 @@ curl -sv -o /dev/null https://www.example.it/ 2>&1 | grep -i issuer
 ```
 With interception active the issuer is `mitmproxy`, and the flow appears in mitmproxy (console or web UI) with the IP of `en0` as client. Today (without interception) it is `Amazon RSA 2048 M04`: Digital Guardian does not do TLS inspection on these connections.
 
+### 11. Mocks: dashboard (`mockui/`) and addon (`scripts/mocks.py`)
+
+Usage: [README.md](README.md#mocks). A mock replaces the response to the requests that match it, in the `request` hook, so the request **never reaches the server** (unlike the old `send_response.py`, which worked on `response`).
+
+#### Why an addon, and not a mock server
+
+Mockoon, WireMock and the like are mock servers to be reached at their own address. In transparent mode the clients' traffic cannot be diverted to them without **rewriting the destination**, which is exactly what this architecture avoids (`route-to` and not `rdr`, so that mitmproxy can recover the original address with `SO_ORIGINAL_DST`: section 2). The fake response therefore has to be injected into the flow by mitmproxy, i.e. by an addon. [`woltapp/mitmproxy-mock`](https://github.com/woltapp/mitmproxy-mock) does the same thing but is configured only by hand in JSON; a dashboard for the mocks is still an open request on mitmproxy's own web UI ([#7878](https://github.com/mitmproxy/mitmproxy/issues/7878)).
+
+#### Two processes, one direction
+
+The dashboard is a **separate process** in the same container, started by `entrypoint.sh`, not code inside the addon: this way the hot reload of the addons never has to release and reopen a socket, and an error in the dashboard does not touch the proxy. It uses `tornado`, already in the image as a dependency of mitmproxy (it is what mitmweb runs on), so **no new package** — the standard library is not enough, `cgi`, which parsed multipart uploads, was removed in Python 3.13.
+
+```
+browser on the Mac ──http://mitmproxy.test:8082──▶ mockui/server.py
+                                                      │ writes
+                                                      ▼
+                            /mocks/enabled  +  /mocks/mocks.json  +  /mocks/files/
+                                                      │ reads                volume ./mocks
+                                                      ▼
+                             mitmproxy + scripts/mocks.py ──▶ fake response in the flow
+                                                      │ writes
+                                                      ▼
+                                           /mocks/hits.json (counters)
+```
+
+Every file has a **single writer** — `enabled` and `mocks.json` belong to the dashboard, `hits.json` to the addon — so there is no lock and no API between the two processes. Writes go through a temporary file and a rename, like the state files of `./mitm`: the reader never sees half a file. The addon rereads `mocks.json` when its mtime changes (one `stat` per request), so a change made from the dashboard, or by hand on the Mac, applies to the next request.
+
+#### The switch is not persisted
+
+`/mocks/enabled` is an empty file whose mere existence means "mocks active". `server.py` **removes it when it starts**, so after every `./mitm start` the mocks are off until the switch in the UI is turned on. The container intercepts the traffic of the whole LAN: a mock left on from a previous session would be hard to diagnose. The same applies if the dashboard is restarted on its own.
+
+#### Plain HTTP, and why
+
+TLS with a certificate for `mitmproxy.test` issued by mitmproxy's own CA was tried and reverted: **Digital Guardian re-signs the browser's connections**, so the browser is handed a certificate issued by `Digital Guardian, Inc`, never ours, and marks it invalid — the extension cannot validate upstream a certificate signed by a root that lives in the user's keychain. From the terminal `curl` and `openssl` are not intercepted and saw the right certificate, which is what made the diagnosis slow (HISTORY, item 19). The same per-process filtering is the reason the whole project exists (*Why this approach*).
+
+The loss is small: the dashboard is reachable only from the Mac over the container network, and no credentials travel on it.
+
+#### Access only from the Mac
+
+The dashboard listens on `0.0.0.0:8082` but rejects with `403` any connection whose source is not in the container network (`MITM_VM_NET`, passed by `entrypoint.sh`, which already computes it for the `iptables` rule). From the Mac the connections arrive through vmnet with a `192.168.64.0/24` source; LAN clients, which can reach the container (the Mac forwards `192.168.3.0/24` → `192.168.64.0/24`), are left out. Unlike the mitmweb UI, no password is needed.
+
+#### Opening it from the console (key `M`)
+
+The container cannot open a browser on the Mac. The `mock.dashboard` command reuses the `./edit` channel of `mac-editor.sh` (section 7): it writes `edit/mock-dashboard.url` with the URL and the request `edit/mock-dashboard.url.open` with the mode `url`, and the loop inside `./mitm open`/`attach` runs `open` on it — after checking that the URL is the dashboard's own, since it arrives from the container. If no terminal is attached, nobody claims the request: after 3s the addon removes it and prints the URL in the event log (`E`). If `open` fails on the Mac, the loop writes the reason in `edit/<file>.error` and the addon reports it in the same place — typically an attached session started before a change to `MOCK_URL`, which rejects the new address: detach and rerun `./mitm open`. Writing the request is retried through the event loop, never with a sleep: a file just removed on the Mac stays visible through the volume for about a second, and recreating it meanwhile fails with `ENOENT`. Outside the console there is `./mitm mock`.
+
 ## Known limitations / still to be verified
 
 - **Mac traffic (section 10) tested only with `curl`**: with `example.com` added to `mac-domains.txt`, `curl https://example.com/` from the Mac responds with issuer `mitmproxy`, so `route-to`, anti-loop tag, REDIRECT in the container, mitmproxy egress and the return path to the IP of `en0` work. With the domain removed, the issuer goes back to the original one (Cloudflare) within ~15s. Still to be tested with a browser (Safari/Chrome, CA in the keychain), checking the counters of `pfctl -a com.apple/100.mitm.route -vsr` (the `route-to` rule on `en0` must count only the browser's connections).
@@ -388,6 +436,8 @@ With interception active the issuer is `mitmproxy`, and the flow appears in mitm
 - **Mac traffic on the default route**: the rules follow the interface of the default route (WiFi, Ethernet). With a VPN (`utun*`) as default route, that would become the WAN: NAT and `route-to` on `utun` are not tested.
 - **Network change applied within 60s** (or immediately, if the system DNS changes): in the meantime the LAN clients' NAT and the Mac's rules stay on the previous WAN.
 
+- **Mocks and QUIC**: what is not intercepted cannot be mocked either — QUIC on UDP 443 (see below) goes out via NAT without ever reaching mitmproxy.
+- **Mock matching is by name, not by IP**: the host compared is the one in the request (`Host` header, thanks to `--showhost`). For the Mac's own traffic the IPs still have to be in `<mitm_local>`, i.e. the domain has to be in `mac-domains.txt`, otherwise the connection never reaches the container.
 - **QUIC/HTTP3 on UDP 443** is not intercepted (`route-to`/`REDIRECT` are TCP only) and, since there is no rule blocking it, it goes out via NAT on `en0`. Clients such as Safari/Chrome on iOS may use it by default for many sites, with traffic bypassing mitmproxy without visible errors. To force the fallback to TCP, the following can be added to the `com.apple/100.mitm.route` rule in [daemon/mitm-pf-apply](daemon/mitm-pf-apply) (then `./mitm install`): `block in quick on en7 inet proto udp from 192.168.3.0/24 to any port 443`.
 - **No DHCP between boot and login**: the `container` services run only in the user session, so DHCP starts at login (LaunchAgent, section 9), not at boot. Before login clients do not get/renew their lease. The pf daemon instead starts at boot and flushes the rules of the previous session.
 - **Start at login tested only with `launchctl bootstrap`**, not yet with an actual logout/login or reboot.

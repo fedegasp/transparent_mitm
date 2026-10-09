@@ -22,6 +22,7 @@ Usage: ./mitm <command>
   open                    open the mitmproxy interface: web UI in the browser,
                           or the console as with attach
   attach                  mitmproxy console (tmux; Ctrl-b d to detach)
+  mock                    mock dashboard in the browser (also M in the console)
   logs [dhcp|pf] [-f]     logs of mitmproxy, dnsmasq or the pf daemon
   build [proxy|dhcp]      build the images (default: both)
   install                 installation (one-off; rerun after changing
@@ -52,6 +53,10 @@ PROXY=mitmproxy.$DNS_DOMAIN
 PROXY_IMAGE=mitm-transparent
 DHCP=mitm-dhcp
 DHCP_IMAGE=mitm-dhcp
+# Mock dashboard (mockui/server.py in the container): same name, another
+# port. Plain HTTP: see HISTORY, item 19
+MOCK_PORT=8082
+MOCK_URL="http://$PROXY:$MOCK_PORT/"
 STATE=/usr/local/var/mitm-pf
 ANCHORS=/etc/pf.anchors
 DAEMON_CONF=/usr/local/etc/mitm.conf
@@ -280,14 +285,19 @@ start_proxy() {
     echo "Creating container $PROXY"
     # ./export: mitmproxy's working directory, files saved by its commands
     # show up here on the Mac. ./edit: files being edited on the Mac
-    # (mac-editor.sh). They must exist, otherwise container run fails.
-    mkdir -p export edit
+    # (mac-editor.sh). ./mocks: mock definitions and uploaded contents,
+    # shared between the addon and the dashboard. ./mockui: the dashboard
+    # itself, mounted so it can be changed without rebuilding the image.
+    # They must exist, otherwise container run fails.
+    mkdir -p export edit mocks
     container run -d --name "$PROXY" \
       --cap-add NET_ADMIN \
       --dns-domain "$DNS_DOMAIN" \
       --volume ./mitmproxy:/root/.mitmproxy \
       --volume ./export:/export \
       --volume ./edit:/edit \
+      --volume ./mocks:/mocks \
+      --volume ./mockui:/mockui \
       -e "MITM_UI=${MITM_UI:-console}" \
       -e "MITM_WEB_PASSWORD=${MITM_WEB_PASSWORD:-password}" \
       "$PROXY_IMAGE" > /dev/null
@@ -313,6 +323,7 @@ start_proxy() {
   else
     echo "Console: ./mitm open   (Ctrl-b d to detach)"
   fi
+  echo "Mock dashboard: $MOCK_URL   (./mitm mock; mocks start disabled)"
 }
 
 # Stops mitmproxy and removes the route-to rules. DHCP stays up: clients
@@ -400,6 +411,14 @@ cmd_status() {
       fi
     done
   fi
+
+  echo
+  # Mocks: read from the volume, without asking the container. The switch is
+  # the existence of mocks/enabled, removed by the dashboard at every start.
+  n=$(jq '[.mocks[] | select(.enabled)] | length' mocks/mocks.json 2> /dev/null || echo 0)
+  printf 'Mocks: %s (%s active out of %s) — %s\n' \
+    "$([ -f mocks/enabled ] && echo "ON: matching requests are not forwarded" || echo "off")" \
+    "$n" "$(jq '.mocks | length' mocks/mocks.json 2> /dev/null || echo 0)" "$MOCK_URL"
 
   echo
   echo "pf rules (com.apple/100.mitm.*):"
@@ -512,15 +531,26 @@ cmd_stop() {
 # the type. The rename claims the request (only one of several attached
 # terminals opens it); open errors go back to the container in
 # edit/<file>.error.
+# The same channel carries the mock dashboard (mode url, key M): there the
+# file holds a URL instead of the content to edit, and it is checked against
+# the dashboard's own address — it arrives from the container, so it is not
+# handed to open as it is.
 edit_watcher() {
-  local req file mode out
+  local req file mode out url
   while sleep 0.5; do
     for req in edit/*.open; do
       mv "$req" "$req.$$" 2> /dev/null || continue
       file=${req%.open}
       mode=$(cat "$req.$$" 2> /dev/null || true)
       rm -f "$req.$$"
-      if [ "$mode" = view ]; then
+      if [ "$mode" = url ]; then
+        url=$(cat "$file" 2> /dev/null || true)
+        rm -f "$file"
+        case $url in
+          "$MOCK_URL"*) out=$(/usr/bin/open "$url" 2>&1) ;;
+          *) out="unexpected URL: $url"; false ;;
+        esac
+      elif [ "$mode" = view ]; then
         out=$(/usr/bin/open "$file" 2>&1) || out=$(/usr/bin/open -t "$file" 2>&1)
       elif [ -n "${MITM_EDITOR:-}" ]; then
         out=$(/usr/bin/open -a "$MITM_EDITOR" "$file" 2>&1)
@@ -559,6 +589,14 @@ cmd_open() {
   else
     attach_console
   fi
+}
+
+# Mock dashboard: always reachable while the container is running, whatever
+# MITM_UI is. The mocks themselves start disabled at every start: the switch
+# is in the dashboard.
+cmd_mock() {
+  [ "$(container_state "$PROXY")" = running ] || die "mitmproxy is not running: ./mitm start"
+  /usr/bin/open "$MOCK_URL"
 }
 
 cmd_logs() {
@@ -606,6 +644,7 @@ case "${1:-}" in
   status) cmd_status ;;
   attach) cmd_attach ;;
   open) cmd_open ;;
+  mock) cmd_mock ;;
   logs) shift; cmd_logs "$@" ;;
   build) shift; cmd_build "$@" ;;
   install) cmd_install ;;

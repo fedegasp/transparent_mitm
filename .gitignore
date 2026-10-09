@@ -3,6 +3,7 @@
 command_history
 /export/
 /edit/
+/mocks/
 __pycache__
 .venv/
 /dhcp/lan.conf

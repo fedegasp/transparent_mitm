@@ -33,8 +33,28 @@ cd /export
 mkdir -p /edit
 find /edit -mindepth 1 -delete
 
+# /mocks (./mocks on the Mac): mock definitions and uploaded contents, shared
+# with the dashboard. The 'enabled' switch is removed by the dashboard at
+# startup: the mocks always start off.
+mkdir -p /mocks/files
+
 # From here on, mitmproxy/mitmweb exiting must not terminate the script
 set +e
+
+# Mock dashboard (./mockui on the Mac), always started, whatever MITM_UI is:
+# the mocks can be prepared with mitmproxy restarting or interception off. It
+# is a separate process on purpose — a crash here, or a reload of the addon
+# that serves the mocks, must not touch the proxy. Supervised like mitmproxy
+# below; PID 1 is tini, so it is reaped correctly. MITM_VM_NET restricts the
+# dashboard to the Mac (see mockui/server.py).
+export MITM_VM_NET="$VM_NET"
+(
+  while true; do
+    python3 /mockui/server.py
+    echo "mock dashboard exited, restarting in 1s..."
+    sleep 1
+  done
+) &
 
 OPTS="--mode transparent --showhost --listen-host 0.0.0.0 --listen-port 7070 --set block_global=false"
 
