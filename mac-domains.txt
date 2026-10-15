@@ -3,4 +3,3 @@
 # Changes are applied automatically on save (LaunchAgent com.mitm.domains).
 example.it
 www.example.it
-cube.example.it

@@ -1,0 +1,71 @@
+#!/bin/bash
+# Domains of the Mac's traffic to intercept (mac-domains.txt): applies the
+# changes and is the bridge towards the dashboard in the container.
+#
+#   mac-domains.txt           ──▶ /usr/local/var/mitm-pf/domains  state of the
+#       com.mitm.pf daemon, which resolves the names into the <mitm_local> table
+#   mac-domains.txt           ──▶ mocks/domains/list.txt          mirror read by
+#       the dashboard, which cannot see the project directory
+#   mocks/domains/request.txt ──▶ mac-domains.txt                 change asked
+#       for by the dashboard
+#
+# The project directory is not a volume of the mitmproxy container (which
+# handles untrusted traffic): this script, which runs as the user, is the only
+# writer of mac-domains.txt and of the mirror, and the dashboard the only
+# writer of the request. Every write is an atomic rename, so no reader ever
+# sees half a file.
+#
+# Run by the LaunchAgent com.mitm.domains at every change of mac-domains.txt
+# or of mocks/domains (WatchPaths), and by ./mitm start. No privileges.
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+STATE=/usr/local/var/mitm-pf
+LIST=mac-domains.txt
+SHARED=mocks/domains
+REQUEST="$SHARED/request.txt"
+CLEAN="$SHARED/.request.clean"
+
+# Atomic rename, like write_state in ./mitm
+replace() {  # replace <destination> <source>
+  local tmp
+  tmp="$(dirname "$1")/.$(basename "$1").tmp"
+  cp "$2" "$tmp"
+  mv "$tmp" "$1"
+}
+
+mkdir -p "$SHARED"
+# Removed by hand, or a fresh clone: without it there is nothing to intercept
+[ -f "$LIST" ] || touch "$LIST"
+
+# Change asked for by the dashboard. It arrives from the container, so it is
+# not copied as it is: only the lines that are a comment, empty or a host name
+# are kept (at most 4 KB, as in the daemon). The file is never executed, but
+# it is still a file of the project.
+if [ -f "$REQUEST" ]; then
+  # grep -a and tr: with a NUL in the input, grep would print "Binary file
+  # matches" instead of the lines, and that message would become the file
+  head -c 4096 "$REQUEST" | tr -d '\r\000' |
+    grep -aE '^[[:space:]]*(#|$)|^[[:space:]]*#?[[:space:]]*[A-Za-z0-9][A-Za-z0-9.-]*[[:space:]]*$' \
+    > "$CLEAN" || true
+  if ! cmp -s "$CLEAN" "$LIST"; then
+    replace "$LIST" "$CLEAN"
+    echo "$(date '+%F %T') $LIST updated from the dashboard"
+  fi
+  # Consumed: its removal triggers the watch again, and that run finds
+  # nothing left to do
+  rm -f "$CLEAN" "$REQUEST"
+fi
+
+# Mirror for the dashboard, and state of the daemon: only if they changed.
+# Writing the mirror triggers the watch on the directory, and an
+# unconditional copy would never settle; the state directory is watched by
+# the pf daemon, which would be woken up for nothing.
+cmp -s "$LIST" "$SHARED/list.txt" || replace "$SHARED/list.txt" "$LIST"
+
+if [ ! -d "$STATE" ]; then
+  echo "$STATE missing: install with ./mitm install" >&2
+  exit 1
+fi
+cmp -s "$LIST" "$STATE/domains" || replace "$STATE/domains" "$LIST"

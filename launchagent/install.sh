@@ -1,7 +1,8 @@
 #!/bin/bash
 # Installs the project's LaunchAgents (one plist per agent in this directory):
 #   com.mitm.dhcp     DHCP started at every login
-#   com.mitm.domains  applies changes to mac-domains.txt immediately
+#   com.mitm.domains  applies changes to mac-domains.txt immediately, and
+#                     bridges the file to the dashboard in the container
 # No privileges: run as a normal user, WITHOUT sudo.
 #   ./launchagent/install.sh             install and start now
 #   ./launchagent/install.sh --remove    uninstall
@@ -20,6 +21,9 @@ for p in "$PROJECT_DIR" "$HOME"; do
 done
 
 mkdir -p ~/Library/LaunchAgents
+# Watched by com.mitm.domains (a WatchPaths on a missing directory is
+# ignored): the dashboard writes its requests here, ./mitm start creates it too
+mkdir -p "$PROJECT_DIR/mocks/domains"
 
 for src in com.mitm.*.plist; do
   LABEL="${src%.plist}"

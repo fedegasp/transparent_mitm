@@ -2,9 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Applies changes to mac-domains.txt immediately (user LaunchAgent, no
-  privileges): on every change copies the file into the state of the daemon
-  com.mitm.pf, which updates the <mitm_local> table. With interception off
-  the daemon ignores the list.
+  privileges), and is the bridge between the file and the dashboard in the
+  container: mitm-domains-apply copies the list into the state of the
+  com.mitm.pf daemon, which updates the <mitm_local> table, mirrors it into
+  mocks/domains/list.txt for the dashboard, and applies the change the
+  dashboard writes in mocks/domains/request.txt. With interception off the
+  daemon ignores the list.
   Installation: ./mitm install (launchagent/install.sh), which replaces __PROJECT_DIR__
   and __HOME__ (launchd does not expand ~ or $HOME).
 -->
@@ -14,17 +17,15 @@
     <string>com.mitm.domains</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>-c</string>
-        <!-- Atomic rename, like write_state in ./mitm. Path as $0: not
-             interpreted by the shell. Missing file (save in progress) =
-             no change. -->
-        <string>S=/usr/local/var/mitm-pf; cat "$0" > "$S/.domains.tmp" &amp;&amp; mv "$S/.domains.tmp" "$S/domains"</string>
-        <string>__PROJECT_DIR__/mac-domains.txt</string>
+        <string>__PROJECT_DIR__/launchagent/mitm-domains-apply</string>
     </array>
+    <!-- The file edited by hand, and the directory shared with the container
+         (a watch on a directory fires when a file is created or removed in
+         it, which is what the atomic renames of both sides do). -->
     <key>WatchPaths</key>
     <array>
         <string>__PROJECT_DIR__/mac-domains.txt</string>
+        <string>__PROJECT_DIR__/mocks/domains</string>
     </array>
     <key>StandardOutPath</key>
     <string>__HOME__/Library/Logs/mitm-domains.log</string>

@@ -53,10 +53,23 @@ header {
 #switch-btn[aria-pressed="true"] { border-color: var(--on); color: var(--on); }
 #switch-btn[aria-pressed="true"] .dot { background: var(--on); box-shadow: 0 0 8px var(--on); }
 
+/* --- tabs ---------------------------------------------------------------- */
+
+.tabs { display: flex; gap: 0.4rem; margin: -0.4rem 0 1.2rem; }
+.tabs button {
+  padding: 0.4rem 0.9rem; border-radius: 999px; font-size: 0.85rem; font-weight: 600;
+  background: transparent; color: var(--muted); border-color: transparent;
+}
+.tabs button:hover { color: var(--text); }
+.tabs button[aria-selected="true"] {
+  background: var(--panel); border-color: var(--line); color: var(--text);
+}
+
 /* --- layout -------------------------------------------------------------- */
 
-main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.5rem; }
-@media (max-width: 1000px) { main { grid-template-columns: minmax(0, 1fr); } }
+.panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.5rem; }
+.panel[hidden] { display: none; }
+@media (max-width: 1000px) { .panel { grid-template-columns: minmax(0, 1fr); } }
 
 .pane { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 1rem 1.1rem 1.2rem; }
 .pane-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
@@ -120,6 +133,16 @@ textarea { min-height: 9rem; resize: vertical; }
 /* + (add row) and × (remove row): same width, so the rows stay aligned */
 .pair-field button.icon { min-width: 1.8rem; font-size: 0.95rem; line-height: 1; }
 .pair-field > button.icon { margin-top: 0.35rem; }
+
+/* --- Mac domains --------------------------------------------------------- */
+
+#domains-list { margin-top: 0.9rem; display: flex; flex-direction: column; gap: 0.35rem; }
+#domains-list:empty::after { content: "No domain: the Mac's traffic is not intercepted."; color: var(--muted); }
+#domains-list .pair.off input[type=text] { color: var(--muted); text-decoration: line-through; }
+#domains-list button.icon, .domains-new button.icon { min-width: 1.8rem; font-size: 0.95rem; line-height: 1; }
+.domains-new { margin-top: 0.5rem; }
+/* Aligned with the rows above, which start with the switch */
+.domains-new::before { content: ""; width: 1.1rem; flex: none; }
 
 fieldset { border: 1px solid var(--line); border-radius: 5px; padding: 0.7rem; margin: 0 0 0.7rem; }
 fieldset[disabled] { opacity: 0.45; }

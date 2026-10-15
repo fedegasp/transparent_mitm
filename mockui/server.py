@@ -22,6 +22,17 @@ mitmproxy's memory, so the dashboard asks the addon for them by writing
 ``ask/<token>.req`` and waiting for the ``ask/<token>.res`` it writes back
 (``/api/history``); the addon polls that directory.
 
+The second tab manages the domains of the Mac's own traffic to intercept,
+which live in ``mac-domains.txt`` in the project directory — not a volume of
+the container. The LaunchAgent ``com.mitm.domains`` is the bridge, with the
+same one-writer-per-file rule as above:
+
+    LaunchAgent  ──writes──▶  domains/list.txt      ──read──▶  dashboard
+    dashboard    ──writes──▶  domains/request.txt   ──read──▶  LaunchAgent
+
+so the container never writes to the project directory
+(``launchagent/mitm-domains-apply``).
+
 ``enabled`` is an empty file whose mere existence means "mocks active". It is
 **removed at startup**: after every container start the mocks are off until the
 switch in the UI is turned on. The container intercepts the traffic of the
@@ -63,6 +74,12 @@ HITS_FILE = MOCKS_DIR / "hits.json"
 ENABLED_FILE = MOCKS_DIR / "enabled"
 ASK_DIR = MOCKS_DIR / "ask"
 
+# Mac domains (mac-domains.txt): the mirror written by the LaunchAgent and the
+# list we ask it to apply. Each one has a single writer, as everything here.
+DOMAINS_DIR = MOCKS_DIR / "domains"
+DOMAINS_LIST = DOMAINS_DIR / "list.txt"
+DOMAINS_REQUEST = DOMAINS_DIR / "request.txt"
+
 # The addon polls ASK_DIR every 0.3s: a couple of seconds are enough, unless
 # mitmproxy is restarting (console: q) or the addon failed to load
 ASK_TIMEOUT = 4.0
@@ -72,6 +89,12 @@ STATIC_DIR = Path(__file__).resolve().parent
 PORT = int(os.environ.get("MOCK_UI_PORT", "8082"))
 
 METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+
+# Same rule as the pf daemon (DOMAIN_RE and MAX_DOMAINS in
+# daemon/mitm-pf-apply): what it would drop is refused here, instead of being
+# written to the file and silently ignored.
+DOMAIN_RE = re.compile(r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+MAX_DOMAINS = 64
 
 # Status codes that must not carry a body (RFC 9110 §6.4.1)
 NO_BODY_STATUS = {204, 304}
@@ -180,6 +203,102 @@ def find(mocks: list[dict[str, Any]], mock_id: str) -> int:
         if mock.get("id") == mock_id:
             return i
     raise tornado.web.HTTPError(404, "mock not found")
+
+
+# ---------------------------------------------------------------------------
+# Mac domains: mac-domains.txt, seen through the LaunchAgent
+# ---------------------------------------------------------------------------
+
+def parse_domains(text: str) -> tuple[list[str], list[dict[str, Any]]]:
+    """Split the file into its leading comments and the domains.
+
+    A comment whose only content is a domain name is a **disabled** domain:
+    that is how the switch of a row is stored, and it is also what commenting
+    out a line by hand has always meant. Any other comment is prose; only the
+    block at the top of the file is kept, and it is rewritten as it is.
+    """
+    header: list[str] = []
+    domains: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        enabled = not stripped.startswith("#")
+        name = stripped.lstrip("#").strip().lower()
+        if DOMAIN_RE.match(name):
+            if not any(d["name"] == name for d in domains):
+                domains.append({"name": name, "enabled": enabled})
+        elif not domains and stripped:
+            # Prose, and no domain seen yet: part of the header
+            header.append(line.rstrip())
+    return header, domains
+
+
+def read_domains(path: Path = DOMAINS_LIST) -> tuple[list[str], list[dict[str, Any]]]:
+    try:
+        return parse_domains(path.read_text())
+    except OSError:
+        return [], []
+
+
+def domains_state() -> dict[str, Any]:
+    _, domains = read_domains()
+    # While a change is waiting for the LaunchAgent, what is shown is the list
+    # asked for and not the mirror, which still holds the previous one
+    pending = DOMAINS_REQUEST.is_file()
+    if pending:
+        _, asked = read_domains(DOMAINS_REQUEST)
+        if DOMAINS_REQUEST.is_file():
+            domains = asked
+        else:
+            pending = False  # applied in the meantime
+    return {
+        "domains": domains,
+        "max": MAX_DOMAINS,
+        # The mirror is missing: the LaunchAgent has never run (not installed,
+        # or the project was moved without rerunning ./mitm install)
+        "ready": DOMAINS_LIST.is_file(),
+        # Change written but not applied yet: the LaunchAgent runs at most
+        # every 10s (ThrottleInterval)
+        "pending": pending,
+    }
+
+
+def clean_domains(data: Any) -> list[dict[str, Any]]:
+    """Build the list to apply from the JSON sent by the browser."""
+    # The message goes through reason=, not log_message: the UI shows it as
+    # it is, and which domain is wrong is the whole point
+    if not isinstance(data, dict) or not isinstance(data.get("domains"), list):
+        raise tornado.web.HTTPError(400, reason="a list of domains is expected")
+
+    out: list[dict[str, Any]] = []
+    for item in data["domains"]:
+        if not isinstance(item, dict):
+            raise tornado.web.HTTPError(400, reason="invalid domain")
+        name = str(item.get("name", "")).strip().lower()
+        if not name:
+            continue  # empty row left in the form
+        if not DOMAIN_RE.match(name):
+            raise tornado.web.HTTPError(400, reason=f"not a domain name: {_reason(name)}")
+        if any(d["name"] == name for d in out):
+            raise tornado.web.HTTPError(400, reason=f"domain repeated: {_reason(name)}")
+        out.append({"name": name, "enabled": bool(item.get("enabled", True))})
+
+    if len(out) > MAX_DOMAINS:
+        raise tornado.web.HTTPError(400, reason=f"at most {MAX_DOMAINS} domains")
+    return out
+
+
+def request_domains(domains: list[dict[str, Any]]) -> None:
+    """Ask the LaunchAgent to write this list into mac-domains.txt.
+
+    The header is not taken from the browser: it is the one read from the
+    file, so nothing arbitrary ends up in a file of the project.
+    """
+    header, _ = read_domains()
+    lines = header + [
+        d["name"] if d["enabled"] else f"# {d['name']}" for d in domains
+    ]
+    DOMAINS_DIR.mkdir(parents=True, exist_ok=True)
+    _write_atomic(DOMAINS_REQUEST, ("\n".join(lines) + "\n").encode())
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +561,22 @@ class EnabledHandler(ApiHandler):
         self.write_state()
 
 
+class DomainsHandler(ApiHandler):
+    """Domains of the Mac's own traffic to intercept (mac-domains.txt).
+
+    Reading is the mirror written by the LaunchAgent; writing is a request to
+    it, applied within a few seconds. Nothing here touches the project
+    directory: the container has no access to it.
+    """
+
+    def get(self) -> None:
+        self.write(domains_state())
+
+    def post(self) -> None:
+        request_domains(clean_domains(self.json_body()))
+        self.write(domains_state())
+
+
 class IndexHandler(Access, tornado.web.RequestHandler):
     def get(self) -> None:
         self.set_header("Content-Type", "text/html; charset=utf-8")
@@ -474,6 +609,7 @@ def make_app() -> tornado.web.Application:
             (r"/api/mocks/([0-9a-f]+)/move", MoveHandler),
             (r"/api/mocks/([0-9a-f]+)/body", BodyHandler),
             (r"/api/enabled", EnabledHandler),
+            (r"/api/domains", DomainsHandler),
             (r"/api/history", HistoryHandler),
             (r"/api/history/([0-9a-fA-F-]{8,64})", HistoryFlowHandler),
             (r"/api/history/([0-9a-fA-F-]{8,64})/body", HistoryBodyHandler),
@@ -489,6 +625,7 @@ async def main() -> None:
     ASK_DIR.mkdir(parents=True, exist_ok=True)
     for leftover in ASK_DIR.iterdir():
         leftover.unlink(missing_ok=True)
+    DOMAINS_DIR.mkdir(parents=True, exist_ok=True)
     # Mocks always start off, whatever the previous run left behind
     set_enabled(False)
     if not MOCKS_FILE.exists():

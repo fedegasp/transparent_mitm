@@ -133,7 +133,8 @@ A single command, [mitm](mitm), for start, stop and diagnostics:
 ./mitm status                  status of containers, pf rules, daemon and agents
 ./mitm open                    mitmproxy interface (web UI in the browser, or console)
 ./mitm attach                  mitmproxy console (tmux)
-./mitm mock                    mock dashboard in the browser (section 11)
+./mitm mock                    dashboard in the browser: mocks and Mac
+                               domains (section 11)
 ./mitm logs [dhcp|pf] [-f]     logs of mitmproxy, dnsmasq or the pf daemon
 ./mitm build [proxy|dhcp]      build the images (default: both)
 ```
@@ -273,7 +274,7 @@ Notes:
 - `--volume ./export:/export`: mitmproxy's working directory, to get on the Mac the files saved by its commands, for example `:save.file @shown flows.mitm` (or `w`), `:export.file curl @focus request.sh`, `:cut.save @focus response.content body.bin`. Relative paths end up in `./export`; absolute ones (e.g. `/tmp/x`) stay in the container. Like `./mitmproxy`, the directory must exist: `./mitm start` creates it. The files appear on the Mac owned by the current user. It is ignored by git.
   A project folder is mounted rather than the Desktop: `~/Desktop` is protected by TCC (the access would be made by `container`'s virtualization process, and on a managed Mac the authorization may be denied by policy), and there is no need to give a root process that handles untrusted traffic write access to the whole Desktop. To keep it at hand: `ln -s "$PWD/export" ~/Desktop/mitm-export`.
 - `--volume ./edit:/edit`: files being edited on the Mac (section 7, *Editing on the Mac*). It must exist too: `./mitm start` creates it.
-- `--volume ./mocks:/mocks` and `--volume ./mockui:/mockui`: mock definitions and uploaded contents, and the dashboard that manages them (section 11). `./mocks` is created by `./mitm start` and ignored by git; `./mockui` is code, and is mounted instead of being copied into the image so it can be changed without a rebuild.
+- `--volume ./mocks:/mocks` and `--volume ./mockui:/mockui`: mock definitions and uploaded contents, the list of Mac domains exchanged with the LaunchAgent `com.mitm.domains` (`./mocks/domains`, section 11), and the dashboard that manages them (section 11). `./mocks` is created by `./mitm start` and ignored by git; `./mockui` is code, and is mounted instead of being copied into the image so it can be changed without a rebuild.
 - `MITM_WEB_PASSWORD` in clear text is visible in `container inspect mitmproxy.test` and in the container's process list. To avoid this, `web_password` also accepts an argon2 hash (mitmweb itself suggests it at startup).
 
 ### 8. Stopping (`./mitm stop`)
@@ -335,11 +336,24 @@ Definition in [launchagent/com.mitm.dhcp.plist](launchagent/com.mitm.dhcp.plist)
 
 #### Changes to `mac-domains.txt` applied on save (LaunchAgent `com.mitm.domains`)
 
-The LaunchAgent has `WatchPaths` on [mac-domains.txt](mac-domains.txt): at every save it copies the file into the `domains` state (atomic rename), and the `com.mitm.pf` daemon, triggered by the change in the state directory, updates the `<mitm_local>` table (section 10). The watch fires both on in-place writes and on editors' atomic saves (new file + rename). launchd runs it at most every 10s (default `ThrottleInterval`): a change made shortly after another is applied with a few seconds' delay. With interception off the daemon ignores the list; `./mitm start` copies it at startup anyway.
+The LaunchAgent has `WatchPaths` on [mac-domains.txt](mac-domains.txt) and runs [launchagent/mitm-domains-apply](launchagent/mitm-domains-apply): at every save it copies the file into the `domains` state (atomic rename), and the `com.mitm.pf` daemon, triggered by the change in the state directory, updates the `<mitm_local>` table (section 10). The watch fires both on in-place writes and on editors' atomic saves (new file + rename). launchd runs it at most every 10s (default `ThrottleInterval`): a change made shortly after another is applied with a few seconds' delay. With interception off the daemon ignores the list; `./mitm start` runs the same script at startup anyway.
+
+The same script is also the bridge towards the dashboard (section 11), which runs in the container and **cannot see the project directory**:
+
+```
+mac-domains.txt ──────────────▶ /usr/local/var/mitm-pf/domains   (pf daemon)
+                └─────────────▶ mocks/domains/list.txt           (dashboard, read only)
+mocks/domains/request.txt ────▶ mac-domains.txt                  (change from the dashboard)
+```
+
+- **The script is the only writer** of `mac-domains.txt` and of the mirror, the dashboard the only writer of the request: as everywhere else here, one writer per file and atomic renames, so no lock and no API between the two sides.
+- **The second `WatchPaths` is the directory** `mocks/domains`, not the two files: a watch on a path that comes and goes is unreliable, while the atomic renames of both sides always change the directory. Writing the mirror and consuming the request trigger the watch again; both are done only if something changed, so the extra run finds nothing to do and stops there.
+- **The request is not copied as it is**: it comes from the container, which handles untrusted traffic, so only the lines that are a comment, empty or a host name are kept (at most 4 KB, as in the daemon). The file is never executed, but it is still a file of the project — and `daemon/mitm-pf-apply`, which runs as root, is in the same directory.
+- **Why not a volume on the project directory**: writable, it would let a compromised container change the `mitm` script or the template of the root daemon (installed by `./mitm install` with sudo); read-only on the single file, an atomic save on the Mac would break the mount for good (the container keeps the old inode), and the Mac side saves exactly like that.
 
 The watch lives in the user session and not in the root daemon: this way the daemon does not need to know the project directory.
 
-Definition in [launchagent/com.mitm.domains.plist](launchagent/com.mitm.domains.plist).
+Definition in [launchagent/com.mitm.domains.plist](launchagent/com.mitm.domains.plist), script in [launchagent/mitm-domains-apply](launchagent/mitm-domains-apply) (run by `./mitm start` too).
 
 #### Installing the LaunchAgents
 
@@ -349,7 +363,7 @@ Logs: `~/Library/Logs/mitm-dhcp.log` and `~/Library/Logs/mitm-domains.log`. Stat
 
 ### 10. Mac traffic to chosen domains (`mac-domains.txt`)
 
-The Mac's browser goes through mitmproxy only for the domains listed in [mac-domains.txt](mac-domains.txt), with or without the LAN: only the container and the WAN (default route) are needed. It is enabled and disabled together with LAN interception (`./mitm start` / `./mitm stop`). Changes to the list are applied when the file is saved, within a few seconds (LaunchAgent `com.mitm.domains`, section 9); without the LaunchAgent, rerunning `./mitm start` is enough.
+The Mac's browser goes through mitmproxy only for the domains listed in [mac-domains.txt](mac-domains.txt), with or without the LAN: only the container and the WAN (default route) are needed. It is enabled and disabled together with LAN interception (`./mitm start` / `./mitm stop`). Changes to the list are applied when the file is saved, within a few seconds (LaunchAgent `com.mitm.domains`, section 9); without the LaunchAgent, rerunning `./mitm start` is enough. The list is edited by hand or from the dashboard, in the `Mac domains` tab (section 11): the file stays the only source, and the dashboard goes through the same LaunchAgent.
 
 Why a route is not enough (`route add -host example.it -interface bridge100`):
 1. `-interface` treats the destination as directly attached to `bridge100`: ARP for the site's IP, nobody answers. The container would be needed as gateway.
@@ -383,9 +397,13 @@ curl -sv -o /dev/null https://www.example.it/ 2>&1 | grep -i issuer
 ```
 With interception active the issuer is `mitmproxy`, and the flow appears in mitmproxy (console or web UI) with the IP of `en0` as client. Today (without interception) it is `Amazon RSA 2048 M04`: Digital Guardian does not do TLS inspection on these connections.
 
-### 11. Mocks: dashboard (`mockui/`) and addon (`scripts/mocks.py`)
+### 11. Dashboard (`mockui/`): mocks (addon `scripts/mocks.py`) and Mac domains
 
-Usage: [README.md](README.md#mocks). A mock replaces the response to the requests that match it, in the `request` hook, so the request **never reaches the server** (unlike the old `send_response.py`, which worked on `response`).
+Usage: [README.md](README.md#dashboard). Two tabs, in one page with no dependencies and no build step: the **mocks**, served by the mitmproxy addon, and the **Mac domains** of section 10. Everything the page needs is a file in the `/mocks` volume, each with a single writer; the only exception is mitmproxy's flow history, which lives in its memory (`/mocks/ask`, below).
+
+#### Mocks
+
+A mock replaces the response to the requests that match it, in the `request` hook, so the request **never reaches the server** (unlike the old `send_response.py`, which worked on `response`).
 
 #### Why an addon, and not a mock server
 
@@ -431,6 +449,16 @@ browser ──GET /api/history[/<flow>]──▶ server.py ──writes──▶
 
 `/mocks/enabled` is an empty file whose mere existence means "mocks active". `server.py` **removes it when it starts**, so after every `./mitm start` the mocks are off until the switch in the UI is turned on. The container intercepts the traffic of the whole LAN: a mock left on from a previous session would be hard to diagnose. The same applies if the dashboard is restarted on its own.
 
+#### Mac domains: the file stays on the Mac
+
+The tab reads `mocks/domains/list.txt`, the mirror of [mac-domains.txt](mac-domains.txt) written by the LaunchAgent `com.mitm.domains`, and a change is `mocks/domains/request.txt`, which the same LaunchAgent applies — the project directory is not a volume of the container, and section 9 explains why.
+
+- **Rebuilt field by field**, as a mock is: the browser sends names and switches, `clean_domains` lowercases them and refuses what is not a domain (the same rule as the daemon, `DOMAIN_RE` and 64 names: what it would silently drop cannot be saved), a name repeated, and more than 64. The comments are **not** sent by the browser: the header is read back from the mirror, so nothing arbitrary ends up in a file of the project.
+- **A disabled domain is a commented line** (`# example.com`): it stays in the file, and that is what commenting a line out by hand has always meant. Any other comment is prose, and only the block at the top of the file is kept — keeping every comment in its place while the rows move around is not worth the trouble.
+- **While a change is pending the tab shows the list asked for**, not the mirror, which still holds the previous one: otherwise the rows would go back to the old values for a few seconds, until the LaunchAgent runs. If the request is still there after 15s the tab says so: the LaunchAgent is not installed (`./mitm install`).
+- **The rows are the draft**: they are read back only when saving, so typing never goes through a render (which would move the caret), and the refresh every 2s does not rebuild a list being edited. The same reason the mock editor is not rebuilt while it is open.
+- **Read only while the tab is open**: nothing to show elsewhere, and the list changes on its own (edited by hand, or a request of ours being applied), so it is polled like the rest of the state.
+
 #### Plain HTTP, and why
 
 TLS with a certificate for `mitmproxy.test` issued by mitmproxy's own CA was tried and reverted: **Digital Guardian re-signs the browser's connections**, so the browser is handed a certificate issued by `Digital Guardian, Inc`, never ours, and marks it invalid — the extension cannot validate upstream a certificate signed by a root that lives in the user's keychain. From the terminal `curl` and `openssl` are not intercepted and saw the right certificate, which is what made the diagnosis slow (HISTORY, item 19). The same per-process filtering is the reason the whole project exists (*Why this approach*).
@@ -453,6 +481,7 @@ The container cannot open a browser on the Mac. The `mock.dashboard` command reu
 - **Mac traffic on the default route**: the rules follow the interface of the default route (WiFi, Ethernet). With a VPN (`utun*`) as default route, that would become the WAN: NAT and `route-to` on `utun` are not tested.
 - **Network change applied within 60s** (or immediately, if the system DNS changes): in the meantime the LAN clients' NAT and the Mac's rules stay on the previous WAN.
 
+- **Mac domains changed from the dashboard applied within ~10s**: launchd runs the LaunchAgent that writes the file at most every 10s (`ThrottleInterval`), and a save makes it run a second time (mirror written, request consumed), so two changes one after the other can take a few seconds more. Saving from the tab also drops the comments of the file other than those at the top (section 11).
 - **Mocks and QUIC**: what is not intercepted cannot be mocked either — QUIC on UDP 443 (see below) goes out via NAT without ever reaching mitmproxy.
 - **Mock matching is by name, not by IP**: the host compared is the one in the request (`Host` header, thanks to `--showhost`). For the Mac's own traffic the IPs still have to be in `<mitm_local>`, i.e. the domain has to be in `mac-domains.txt`, otherwise the connection never reaches the container.
 - **QUIC/HTTP3 on UDP 443** is not intercepted (`route-to`/`REDIRECT` are TCP only) and, since there is no rule blocking it, it goes out via NAT on `en0`. Clients such as Safari/Chrome on iOS may use it by default for many sites, with traffic bypassing mitmproxy without visible errors. To force the fallback to TCP, the following can be added to the `com.apple/100.mitm.route` rule in [daemon/mitm-pf-apply](daemon/mitm-pf-apply) (then `./mitm install`): `block in quick on en7 inet proto udp from 192.168.3.0/24 to any port 443`.

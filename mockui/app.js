@@ -1,9 +1,11 @@
 "use strict";
 
-// Mock dashboard: single page, no dependencies and no build step.
+// mitm dashboard: single page, no dependencies and no build step.
+// Two tabs: the mocks and the domains of the Mac's own traffic.
 // The server (server.py) returns the whole state at every call, so there is
 // nothing to keep in sync by hand: every response replaces `state`.
 
+let tab = "mocks";    // selected tab: "mocks" or "domains"
 let state = { enabled: false, mocks: [], hits: {}, methods: [], no_body_status: [] };
 let editing = null;   // id of the mock being edited, or "new"
 let pendingFile = null;  // file chosen but not yet uploaded (saved first)
@@ -49,15 +51,33 @@ async function api(path, options = {}) {
   return state;
 }
 
-// Requests of the history: unlike the mocks, these are not the state of the
-// dashboard, so they do not go through api()
-async function fetchJson(path) {
-  const response = await fetch(path);
+// The history and the Mac domains: unlike the mocks, they are not the state
+// returned by every call, so they do not go through api()
+async function fetchJson(path, options = {}) {
+  const response = await fetch(path, options);
   if (!response.ok) {
     showError(`${response.status} ${response.statusText}`);
     throw new Error(response.statusText);
   }
   return response.json();
+}
+
+// --- tabs ------------------------------------------------------------------
+
+function selectTab(name) {
+  tab = name;
+  for (const button of document.querySelectorAll('[role="tab"]')) {
+    const selected = button.dataset.tab === name;
+    button.setAttribute("aria-selected", String(selected));
+    $(`panel-${button.dataset.tab}`).hidden = !selected;
+  }
+  // The domains are read only while their tab is open: nothing to show
+  // elsewhere, and the list comes from the Mac through the LaunchAgent
+  if (name === "domains") loadDomains();
+}
+
+for (const button of document.querySelectorAll('[role="tab"]')) {
+  button.onclick = () => selectTab(button.dataset.tab);
 }
 
 // --- global switch ---------------------------------------------------------
@@ -476,12 +496,146 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !$("picker").hidden) closePicker();
 });
 
+// --- Mac domains tab -------------------------------------------------------
+//
+// mac-domains.txt is in the project directory on the Mac, which is not a
+// volume of the container: the LaunchAgent com.mitm.domains mirrors it for us
+// and applies the list we ask for (see server.py and
+// launchagent/mitm-domains-apply). So a change is not immediate: it is
+// written as a request, and shows up in the mirror once applied.
+
+let domains = null;        // answer of /api/domains, null = not read yet
+let domainsDirty = false;  // list edited and not saved: do not rebuild it
+let pendingSince = 0;      // when the request being applied was noticed
+
+function domainRow(entry) {
+  const on = el("input", { type: "checkbox", checked: entry.enabled });
+  const name = el("input", {
+    type: "text", value: entry.name, placeholder: "www.example.com",
+    spellcheck: false, autocapitalize: "off", autocomplete: "off",
+  });
+  const del = el("button", { type: "button", textContent: "×", className: "icon", title: "Remove" });
+  const row = el("div", { className: `pair${entry.enabled ? "" : " off"}` }, [
+    el("label", { className: "check", title: "Intercept this domain" }, [on]),
+    name,
+    del,
+  ]);
+  on.onchange = () => {
+    row.classList.toggle("off", !on.checked);
+    touchDomains();
+  };
+  name.oninput = touchDomains;
+  del.onclick = () => { row.remove(); touchDomains(); };
+  return row;
+}
+
+// The rows are the draft: they are read back only here, so typing in them
+// never goes through a render (which would move the caret)
+const domainRows = () =>
+  [...$("domains-list").children].map((row) => ({
+    name: row.querySelector('input[type="text"]').value.trim().toLowerCase(),
+    enabled: row.querySelector('input[type="checkbox"]').checked,
+  })).filter((d) => d.name);
+
+function touchDomains() {
+  domainsDirty = true;
+  renderDomainsInfo();
+}
+
+function addDomain() {
+  const input = $("domains-input");
+  const name = input.value.trim().toLowerCase();
+  if (!name) return;
+  $("domains-list").append(domainRow({ name, enabled: true }));
+  input.value = "";
+  input.focus();
+  touchDomains();
+}
+
+// Count and note: what the rows say, which while editing is not what the
+// server knows yet
+function renderDomainsInfo() {
+  const rows = domainRows();
+  const on = rows.filter((d) => d.enabled).length;
+  $("domains-count").textContent = rows.length
+    ? `— ${on} intercepted out of ${rows.length}` : "";
+  $("domains-save").disabled = !domainsDirty;
+  $("domains-reset").disabled = !domainsDirty;
+
+  const note = $("domains-note");
+  note.classList.remove("warn");
+  if (domains === null) {
+    note.textContent = "Reading the list…";
+  } else if (!domains.ready) {
+    note.textContent = "List not available: the com.mitm.domains LaunchAgent has"
+      + " never run. Install it with ./mitm install.";
+    note.classList.add("warn");
+  } else if (domains.pending && Date.now() - pendingSince > 15000) {
+    note.textContent = "The change has not been applied: is the com.mitm.domains"
+      + " LaunchAgent installed? ./mitm install, then ./mitm status.";
+    note.classList.add("warn");
+  } else if (domains.pending) {
+    note.textContent = "Applying the change on the Mac…";
+  } else if (domainsDirty) {
+    note.textContent = "Unsaved changes: ✓ applies them, ✕ discards them.";
+  } else {
+    note.textContent = "A change is applied within a few seconds, even without"
+      + " the LAN. Of the comments in the file, only those at the top are kept.";
+  }
+}
+
+function renderDomains() {
+  // While the list is being edited only the note changes: rebuilding the rows
+  // would throw away what is being typed
+  if (!domainsDirty) {
+    const list = $("domains-list");
+    list.textContent = "";
+    (domains ? domains.domains : []).forEach((entry) => list.append(domainRow(entry)));
+  }
+  renderDomainsInfo();
+}
+
+async function loadDomains() {
+  try {
+    const answer = await fetchJson("/api/domains");
+    if (answer.pending && !(domains && domains.pending)) pendingSince = Date.now();
+    domains = answer;
+  } catch {
+    return;  // the error is already shown
+  }
+  renderDomains();
+}
+
+$("domains-add").onclick = addDomain;
+$("domains-input").onkeydown = (event) => { if (event.key === "Enter") addDomain(); };
+$("domains-reset").onclick = () => { domainsDirty = false; renderDomains(); };
+
+$("domains-save").onclick = async () => {
+  const button = $("domains-save");
+  button.disabled = true;
+  try {
+    domains = await fetchJson("/api/domains", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domains: domainRows() }),
+    });
+    pendingSince = Date.now();
+    domainsDirty = false;
+  } catch {
+    // Refused (not a domain name, duplicate, too many): already shown, and
+    // the rows are left as they are so they can be fixed
+  } finally {
+    renderDomains();
+  }
+};
+
 // --- loop ------------------------------------------------------------------
 
 function render() {
   renderSwitch();
   renderList();
   renderEditor();
+  renderDomains();
 }
 
 // Re-reads the state to keep the hit counters and any change made by hand to
@@ -495,6 +649,9 @@ async function refresh() {
   renderSwitch();
   renderList();
   if (editing === null) renderEditor();
+  // The list comes from the Mac through the LaunchAgent: it changes on its
+  // own (edited by hand, or a request of ours being applied)
+  if (tab === "domains") await loadDomains();
 }
 
 api("/api/mocks").catch(() => showError("Dashboard unreachable"));

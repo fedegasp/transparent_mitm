@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mock dashboard</title>
+<title>mitm dashboard</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 
 <header>
-  <h1>Mock dashboard</h1>
+  <h1>mitm dashboard</h1>
   <div id="switch" class="switch">
     <button id="switch-btn" type="button" aria-pressed="false">
       <span class="dot"></span><span id="switch-label">Mocks off</span>
@@ -18,22 +18,56 @@
   </div>
 </header>
 
-<main>
-  <section class="pane">
-    <div class="pane-head">
-      <h2>Mocks <span id="count" class="muted"></span></h2>
-      <div class="form-actions">
-        <button id="from-btn" type="button">From a request</button>
-        <button id="new-btn" type="button" class="primary">+ New mock</button>
-      </div>
-    </div>
-    <p class="note">The first enabled mock that matches wins, from the top down.</p>
-    <div id="list"></div>
-  </section>
+<nav class="tabs" role="tablist" aria-label="Sections">
+  <button id="tab-mocks" type="button" role="tab" data-tab="mocks"
+          aria-controls="panel-mocks" aria-selected="true">Mocks</button>
+  <button id="tab-domains" type="button" role="tab" data-tab="domains"
+          aria-controls="panel-domains" aria-selected="false">Mac domains</button>
+</nav>
 
-  <section class="pane" id="editor-pane" hidden>
-    <div id="editor"></div>
-  </section>
+<main>
+  <div id="panel-mocks" class="panel" role="tabpanel" aria-labelledby="tab-mocks">
+    <section class="pane">
+      <div class="pane-head">
+        <h2>Mocks <span id="count" class="muted"></span></h2>
+        <div class="form-actions">
+          <button id="from-btn" type="button">From a request</button>
+          <button id="new-btn" type="button" class="primary">+ New mock</button>
+        </div>
+      </div>
+      <p class="note">The first enabled mock that matches wins, from the top down.</p>
+      <div id="list"></div>
+    </section>
+
+    <section class="pane" id="editor-pane" hidden>
+      <div id="editor"></div>
+    </section>
+  </div>
+
+  <div id="panel-domains" class="panel" role="tabpanel" aria-labelledby="tab-domains" hidden>
+    <section class="pane">
+      <div class="pane-head">
+        <h2>Mac domains <span id="domains-count" class="muted"></span></h2>
+        <div class="form-actions">
+          <button id="domains-save" type="button" class="primary" title="Save" aria-label="Save">✓</button>
+          <button id="domains-reset" type="button" title="Discard the changes" aria-label="Discard">✕</button>
+        </div>
+      </div>
+      <p class="note">
+        Domains of <strong>the Mac's own</strong> traffic to send through mitmproxy
+        (<code>mac-domains.txt</code>), one per line, no wildcards:
+        <code>example.com</code> and <code>www.example.com</code> are distinct.
+        LAN clients are intercepted whatever is in this list.
+      </p>
+      <div id="domains-list"></div>
+      <div class="pair domains-new">
+        <input id="domains-input" type="text" placeholder="www.example.com" spellcheck="false"
+               autocapitalize="off" autocomplete="off">
+        <button id="domains-add" type="button" class="icon" title="Add" aria-label="Add">+</button>
+      </div>
+      <p id="domains-note" class="note"></p>
+    </section>
+  </div>
 </main>
 
 <div id="picker" class="overlay" hidden>
