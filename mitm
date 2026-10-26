@@ -572,7 +572,10 @@ attach_console() {
   mkdir -p edit
   edit_watcher > /dev/null 2>&1 &
   trap "kill $! 2> /dev/null" EXIT
-  container exec -it "$PROXY" tmux attach -t mitm
+  # -u: the exec environment has no LANG, and without it tmux decides the
+  # terminal is not UTF-8 and writes "_" for every non-ASCII glyph of the
+  # console (the mark "●", the replay arrows, "…")
+  container exec -it "$PROXY" tmux -u attach -t mitm
 }
 
 cmd_attach() {

@@ -60,7 +60,7 @@ OPTS="--mode transparent --showhost --listen-host 0.0.0.0 --listen-port 7070 --s
 
 # MITM_UI=console (default): mitmproxy (text interface) in a tmux session
 # "mitm", to attach with
-#   container exec -it mitmproxy.test tmux attach -t mitm
+#   container exec -it mitmproxy.test tmux -u attach -t mitm
 # The inner loop restarts mitmproxy after it exits (q) without closing the
 # session; the outer one recreates the session if it is closed (kill-session),
 # and keeps the container alive.
