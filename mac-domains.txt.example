@@ -1,5 +1,8 @@
 # Domains of the Mac's traffic to intercept with mitmproxy (one domain per
 # line, no wildcards: every name used by the site must be listed separately).
 # Changes are applied automatically on save (LaunchAgent com.mitm.domains).
+#
+# Template: copy it to mac-domains.txt, which is not in git because it is
+# specific to this installation (./mitm start creates it empty if missing).
 example.it
 www.example.it

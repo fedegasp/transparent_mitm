@@ -6,7 +6,7 @@ Why and how it works. Installation and usage: [README.md](README.md); problems e
 
 Intercept the HTTP/HTTPS traffic of devices connected to the Mac's physical LAN, routing it to `mitmproxy` running inside a Linux VM managed by Apple `container`. This architecture enables transparent proxying of the LAN.
 
-The same container also intercepts the traffic **of the Mac itself**, only towards a list of chosen domains ([mac-domains.txt](mac-domains.txt)), even when the Mac is not connected to the LAN (`en7`): section 10.
+The same container also intercepts the traffic **of the Mac itself**, only towards a list of chosen domains (`mac-domains.txt`), even when the Mac is not connected to the LAN (`en7`): section 10.
 
 ## Why this approach
 
@@ -313,7 +313,7 @@ user script ──writes IP────▶ /usr/local/var/mitm-pf/{route,dhcp}  
 - **State files** (written with an atomic rename, so the daemon never reads a half-written file):
   - `route` → `<mitmproxy IP>` (empty = no interception; the daemon derives the bridge);
   - `dhcp` → `<dnsmasq IP>` (empty = no DHCP/DNS);
-  - `domains` → copy of [mac-domains.txt](mac-domains.txt), written by `./mitm start` and by the `com.mitm.domains` LaunchAgent at every change of the file (section 10).
+  - `domains` → copy of `mac-domains.txt`, written by `./mitm start` and by the `com.mitm.domains` LaunchAgent at every change of the file (section 10).
 - **Validation**: the content is user-writable, so it is never executed or copied as is; the daemon only accepts IPv4 addresses and domain names (regex, at most 64) and generates the rule from a fixed template. Any other content empties the rule (or, for domains, is ignored).
 - **Configuration and network**: it reads `LAN_IP` and `ROUTER_IP` from its own copy of `mitm.conf` (`/usr/local/etc/mitm.conf`, root:wheel) and at every run derives WAN, LAN interface and bridge (see *Configuration*). The detected network is logged when it changes.
 - **Every 60s** (`StartInterval`) and **at every change of the system DNS** (`WatchPaths` on `/var/run/resolv.conf`, which changes with the network): the daemon regenerates the rules if the network has changed and, with interception active, re-resolves the domains and updates the `<mitm_local>` table; if nothing changes it does not touch pf.
@@ -336,7 +336,7 @@ Definition in [launchagent/com.mitm.dhcp.plist](launchagent/com.mitm.dhcp.plist)
 
 #### Changes to `mac-domains.txt` applied on save (LaunchAgent `com.mitm.domains`)
 
-The LaunchAgent has `WatchPaths` on [mac-domains.txt](mac-domains.txt) and runs [launchagent/mitm-domains-apply](launchagent/mitm-domains-apply): at every save it copies the file into the `domains` state (atomic rename), and the `com.mitm.pf` daemon, triggered by the change in the state directory, updates the `<mitm_local>` table (section 10). The watch fires both on in-place writes and on editors' atomic saves (new file + rename). launchd runs it at most every 10s (default `ThrottleInterval`): a change made shortly after another is applied with a few seconds' delay. With interception off the daemon ignores the list; `./mitm start` runs the same script at startup anyway.
+The LaunchAgent has `WatchPaths` on `mac-domains.txt` and runs [launchagent/mitm-domains-apply](launchagent/mitm-domains-apply): at every save it copies the file into the `domains` state (atomic rename), and the `com.mitm.pf` daemon, triggered by the change in the state directory, updates the `<mitm_local>` table (section 10). The watch fires both on in-place writes and on editors' atomic saves (new file + rename). launchd runs it at most every 10s (default `ThrottleInterval`): a change made shortly after another is applied with a few seconds' delay. With interception off the daemon ignores the list; `./mitm start` runs the same script at startup anyway.
 
 The same script is also the bridge towards the dashboard (section 11), which runs in the container and **cannot see the project directory**:
 
@@ -363,7 +363,7 @@ Logs: `~/Library/Logs/mitm-dhcp.log` and `~/Library/Logs/mitm-domains.log`. Stat
 
 ### 10. Mac traffic to chosen domains (`mac-domains.txt`)
 
-The Mac's browser goes through mitmproxy only for the domains listed in [mac-domains.txt](mac-domains.txt), with or without the LAN: only the container and the WAN (default route) are needed. It is enabled and disabled together with LAN interception (`./mitm start` / `./mitm stop`). Changes to the list are applied when the file is saved, within a few seconds (LaunchAgent `com.mitm.domains`, section 9); without the LaunchAgent, rerunning `./mitm start` is enough. The list is edited by hand or from the dashboard, in the `Mac domains` tab (section 11): the file stays the only source, and the dashboard goes through the same LaunchAgent.
+The Mac's browser goes through mitmproxy only for the domains listed in `mac-domains.txt`, with or without the LAN: only the container and the WAN (default route) are needed. It is enabled and disabled together with LAN interception (`./mitm start` / `./mitm stop`). Changes to the list are applied when the file is saved, within a few seconds (LaunchAgent `com.mitm.domains`, section 9); without the LaunchAgent, rerunning `./mitm start` is enough. The list is edited by hand or from the dashboard, in the `Mac domains` tab (section 11): the file stays the only source, and the dashboard goes through the same LaunchAgent. The file itself is not in git — it is the list of this installation, not of the project — and [mac-domains.txt.example](mac-domains.txt.example) is its template: `launchagent/mitm-domains-apply`, run by `./mitm start`, creates it empty if it is missing.
 
 Why a route is not enough (`route add -host example.it -interface bridge100`):
 1. `-interface` treats the destination as directly attached to `bridge100`: ARP for the site's IP, nobody answers. The container would be needed as gateway.
@@ -451,7 +451,7 @@ browser ──GET /api/history[/<flow>]──▶ server.py ──writes──▶
 
 #### Mac domains: the file stays on the Mac
 
-The tab reads `mocks/domains/list.txt`, the mirror of [mac-domains.txt](mac-domains.txt) written by the LaunchAgent `com.mitm.domains`, and a change is `mocks/domains/request.txt`, which the same LaunchAgent applies — the project directory is not a volume of the container, and section 9 explains why.
+The tab reads `mocks/domains/list.txt`, the mirror of `mac-domains.txt` written by the LaunchAgent `com.mitm.domains`, and a change is `mocks/domains/request.txt`, which the same LaunchAgent applies — the project directory is not a volume of the container, and section 9 explains why.
 
 - **Rebuilt field by field**, as a mock is: the browser sends names and switches, `clean_domains` lowercases them and refuses what is not a domain (the same rule as the daemon, `DOMAIN_RE` and 64 names: what it would silently drop cannot be saved), a name repeated, and more than 64. The comments are **not** sent by the browser: the header is read back from the mirror, so nothing arbitrary ends up in a file of the project.
 - **A disabled domain is a commented line** (`# example.com`): it stays in the file, and that is what commenting a line out by hand has always meant. Any other comment is prose, and only the block at the top of the file is kept — keeping every comment in its place while the rows move around is not worth the trouble.
