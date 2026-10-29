@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tmux \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir "mitmproxy==12.2.3"
+RUN pip install --no-cache-dir "mitmproxy==12.3.1"
 
 COPY entrypoint.sh /entrypoint.sh
 COPY mac-editor.sh /usr/local/bin/mac-editor
